@@ -1,0 +1,36 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "common/app_config.c"
+        "common/cloud_service.c"
+        "common/ui_status.c"
+        "drivers/display_st7789.c"
+        "drivers/font_gb2312.c"
+        "drivers/wifi_manager.c"
+        "drivers/mesh_audio_board.c"
+        "middle/ble_provision.c"
+        "middle/mesh_audio_node.c"
+        "app/mesh_audio_gateway.c"
+        "app/mesh_audio_controller.c"
+        "app/mesh_audio_speaker.c"
+    INCLUDE_DIRS
+        "."
+        "app"
+        "common"
+        "drivers"
+        "middle"
+    REQUIRES
+        bt
+        esp_http_client
+        esp_driver_gpio
+        esp_driver_spi
+        mbedtls
+        json
+        esp_lcd
+        esp_lvgl_port
+        esp_event
+        esp_hw_support
+        esp_netif
+        esp_wifi
+        nvs_flash
+)

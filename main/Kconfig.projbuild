@@ -1,0 +1,257 @@
+menu "ST7789 SPI Display"
+
+    config DISPLAY_ST7789_ENABLE
+        bool "Enable ST7789 SPI display"
+        default y
+        help
+            Enable a simple ST7789 SPI display bring-up path.
+            The driver initializes the panel and draws color bars at boot.
+
+    config DISPLAY_ST7789_H_RES
+        int "LCD horizontal resolution"
+        depends on DISPLAY_ST7789_ENABLE
+        default 240
+
+    config DISPLAY_ST7789_V_RES
+        int "LCD vertical resolution"
+        depends on DISPLAY_ST7789_ENABLE
+        default 320
+
+    config DISPLAY_ST7789_PIXEL_CLOCK_HZ
+        int "SPI pixel clock Hz"
+        depends on DISPLAY_ST7789_ENABLE
+        default 60000000
+        help
+            Higher clock improves refresh speed. If the display is unstable or has snow/noise, try 40000000 or 20000000.
+
+    config DISPLAY_ST7789_SCLK_GPIO
+        int "SCL/SCLK GPIO"
+        depends on DISPLAY_ST7789_ENABLE
+        range 0 48
+        default 12
+
+    config DISPLAY_ST7789_MOSI_GPIO
+        int "SDA/MOSI GPIO"
+        depends on DISPLAY_ST7789_ENABLE
+        range 0 48
+        default 11
+
+    config DISPLAY_ST7789_MISO_GPIO
+        int "SDO/MISO GPIO"
+        depends on DISPLAY_ST7789_ENABLE
+        range -1 48
+        default 10
+        help
+            ST7789 itself does not need MISO. Some GB2312 font chips need a data output pin.
+            Keep -1 if the module does not expose SDO/MISO.
+
+    config DISPLAY_ST7789_CS_GPIO
+        int "CS GPIO"
+        depends on DISPLAY_ST7789_ENABLE
+        range 0 48
+        default 8
+
+    config DISPLAY_ST7789_DC_GPIO
+        int "DC GPIO"
+        depends on DISPLAY_ST7789_ENABLE
+        range 0 48
+        default 9
+
+    config DISPLAY_ST7789_RST_GPIO
+        int "RST GPIO"
+        depends on DISPLAY_ST7789_ENABLE
+        range -1 48
+        default 13
+        help
+            Set to -1 if the display reset pin is not connected to ESP32-S3.
+
+    config DISPLAY_ST7789_BL_GPIO
+        int "BL/backlight GPIO"
+        depends on DISPLAY_ST7789_ENABLE
+        range -1 48
+        default -1
+        help
+            Set to -1 if BL is tied directly to VCC.
+
+    config DISPLAY_ST7789_BL_ON_LEVEL
+        int "Backlight ON level"
+        depends on DISPLAY_ST7789_ENABLE
+        range 0 1
+        default 1
+
+    config DISPLAY_ST7789_BL_OFF_LEVEL
+        int "Backlight OFF level"
+        depends on DISPLAY_ST7789_ENABLE
+        range 0 1
+        default 0
+
+    config DISPLAY_ST7789_BGR
+        bool "Use BGR color order"
+        depends on DISPLAY_ST7789_ENABLE
+        default n
+
+    config DISPLAY_ST7789_INVERT_COLOR
+        bool "Invert color"
+        depends on DISPLAY_ST7789_ENABLE
+        default y
+        help
+            Many ST7789 modules need color inversion enabled.
+
+    config DISPLAY_ST7789_SWAP_XY
+        bool "Swap X/Y axis"
+        depends on DISPLAY_ST7789_ENABLE
+        default n
+
+    config DISPLAY_ST7789_MIRROR_X
+        bool "Mirror X axis"
+        depends on DISPLAY_ST7789_ENABLE
+        default n
+
+    config DISPLAY_ST7789_MIRROR_Y
+        bool "Mirror Y axis"
+        depends on DISPLAY_ST7789_ENABLE
+        default n
+
+    config DISPLAY_ST7789_X_GAP
+        int "X gap"
+        depends on DISPLAY_ST7789_ENABLE
+        default 0
+
+    config DISPLAY_ST7789_Y_GAP
+        int "Y gap"
+        depends on DISPLAY_ST7789_ENABLE
+        default 0
+
+    config FONT_GB2312_ENABLE
+        bool "Enable external GB2312 font chip"
+        depends on DISPLAY_ST7789_ENABLE
+        default y
+        help
+            Enable the external GB2312 Songti font chip on the display module.
+            The chip shares the display SPI bus and uses a separate CSF pin.
+
+    config FONT_GB2312_CSF_GPIO
+        int "GB2312 font chip CSF GPIO"
+        depends on FONT_GB2312_ENABLE
+        range 0 48
+        default 7
+
+    config FONT_GB2312_SPI_CLOCK_HZ
+        int "GB2312 font chip SPI clock Hz"
+        depends on FONT_GB2312_ENABLE
+        default 10000000
+        help
+            Keep this lower than LCD pixel clock. If glyph reading is unstable, try 4000000.
+
+    choice FONT_GB2312_DEFAULT_SIZE_CHOICE
+        prompt "Default GB2312 font size"
+        depends on FONT_GB2312_ENABLE
+        default FONT_GB2312_DEFAULT_SIZE_16
+
+        config FONT_GB2312_DEFAULT_SIZE_12
+            bool "12x12"
+
+        config FONT_GB2312_DEFAULT_SIZE_14
+            bool "14x14"
+
+        config FONT_GB2312_DEFAULT_SIZE_16
+            bool "16x16"
+
+        config FONT_GB2312_DEFAULT_SIZE_18
+            bool "18x18"
+
+        config FONT_GB2312_DEFAULT_SIZE_20
+            bool "20x20"
+
+        config FONT_GB2312_DEFAULT_SIZE_22
+            bool "22x22"
+
+        config FONT_GB2312_DEFAULT_SIZE_24
+            bool "24x24"
+
+        config FONT_GB2312_DEFAULT_SIZE_26
+            bool "26x26"
+    endchoice
+
+    config FONT_GB2312_DEFAULT_SIZE
+        int
+        depends on FONT_GB2312_ENABLE
+        default 12 if FONT_GB2312_DEFAULT_SIZE_12
+        default 14 if FONT_GB2312_DEFAULT_SIZE_14
+        default 16 if FONT_GB2312_DEFAULT_SIZE_16
+        default 18 if FONT_GB2312_DEFAULT_SIZE_18
+        default 20 if FONT_GB2312_DEFAULT_SIZE_20
+        default 22 if FONT_GB2312_DEFAULT_SIZE_22
+        default 24 if FONT_GB2312_DEFAULT_SIZE_24
+        default 26 if FONT_GB2312_DEFAULT_SIZE_26
+
+    config FONT_GB2312_BASE_12
+        hex "12x12 font base address"
+        depends on FONT_GB2312_ENABLE
+        default 0x000000
+
+    config FONT_GB2312_BASE_14
+        hex "14x14 font base address"
+        depends on FONT_GB2312_ENABLE
+        default 0x02FEF0
+
+    config FONT_GB2312_BASE_16
+        hex "16x16 font base address"
+        depends on FONT_GB2312_ENABLE
+        default 0x067D68
+
+    config FONT_GB2312_BASE_18
+        hex "18x18 font base address"
+        depends on FONT_GB2312_ENABLE
+        default 0x0A7BA8
+
+    config FONT_GB2312_BASE_20
+        hex "20x20 font base address"
+        depends on FONT_GB2312_ENABLE
+        default 0x1137B4
+
+    config FONT_GB2312_BASE_22
+        hex "22x22 font base address"
+        depends on FONT_GB2312_ENABLE
+        default 0x18B5A4
+
+    config FONT_GB2312_BASE_24
+        hex "24x24 font base address"
+        depends on FONT_GB2312_ENABLE
+        default 0x20F43C
+
+    config FONT_GB2312_BASE_26
+        hex "26x26 font base address"
+        depends on FONT_GB2312_ENABLE
+        default 0x2BD054
+
+endmenu
+
+menu "Mesh Audio Control"
+
+    config MESH_AUDIO_ENABLE
+        bool "Enable BLE Mesh audio control mode"
+        default n
+        select BT_NIMBLE_MESH
+        select BT_NIMBLE_MESH_PROV
+        select BT_NIMBLE_MESH_PB_ADV
+        help
+            Enable BLE Mesh audio-control mode.
+            When disabled, the project keeps the existing Wi-Fi + BLE provisioning flow.
+
+    choice MESH_AUDIO_ROLE
+        prompt "Mesh audio device role"
+        depends on MESH_AUDIO_ENABLE
+        default MESH_AUDIO_ROLE_GATEWAY
+
+        config MESH_AUDIO_ROLE_GATEWAY
+            bool "Gateway"
+
+        config MESH_AUDIO_ROLE_CONTROLLER
+            bool "Controller"
+
+        config MESH_AUDIO_ROLE_SPEAKER
+            bool "Speaker"
+    endchoice
+
+endmenu
