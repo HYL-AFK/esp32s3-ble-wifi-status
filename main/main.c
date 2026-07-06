@@ -11,6 +11,7 @@
 #include "mesh_audio_controller.h"
 #include "mesh_audio_gateway.h"
 #include "mesh_audio_speaker.h"
+#include "ota_service.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "main";
@@ -43,6 +44,7 @@ static void handle_wifi_status_changed(void)
 {
     ble_provision_refresh_advertising();
     cloud_service_notify_wifi_state();
+    ota_service_notify_wifi_state();
     ui_status_refresh();
 }
 
@@ -67,6 +69,11 @@ void app_main(void)
     ret = cloud_service_init();
     if (ret != ESP_OK) {
         APP_LOGW(TAG, "cloud service init failed: %s", esp_err_to_name(ret));
+    }
+
+    ret = ota_service_init();
+    if (ret != ESP_OK) {
+        APP_LOGW(TAG, "OTA service init failed: %s", esp_err_to_name(ret));
     }
 
     /*
@@ -110,5 +117,7 @@ void app_main(void)
     } else {
         APP_LOGI(TAG, "boot with no saved wifi profile");
     }
+
+    ota_service_mark_app_valid_if_needed();
 #endif
 }

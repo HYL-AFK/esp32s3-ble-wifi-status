@@ -145,3 +145,39 @@ AA 55 | length(2) | mac(6) | cmd(1) | seq(1) | data(N) | crc16(2) | 55 AA
   - 分页回读
   - 多帧分片回读
   - 或者拆成多个独立查询命令
+
+## 9. OTA 调试命令
+
+OTA 使用 `manifest.json + HTTPS + Range` 方案，不通过 BLE 直接传固件。
+
+文本命令：
+
+- `OTA_START <manifest_url>`：从 HTTPS manifest 开始 OTA。
+- `OTA_STATUS`：回读 OTA 状态片段。
+- `OTA_CANCEL`：取消当前 OTA，并清除断点状态。
+- `OTA_RESUME`：手动恢复未完成 OTA。
+- `OTA_REBOOT`：OTA 校验成功后重启进入新固件。
+
+`STATUS` JSON 会追加 OTA 字段：
+
+- `ota_state`
+- `ota_progress`
+- `ota_version`
+- `ota_written`
+- `ota_total`
+- `ota_error`
+- `ota_resume_valid`
+
+manifest 示例：
+
+```json
+{
+  "project": "t1",
+  "chip": "esp32s3",
+  "version": "1.0.1",
+  "url": "https://example.com/firmware/t1-1.0.1.bin",
+  "size": 1536000,
+  "sha256": "64位小写hex",
+  "force": false
+}
+```

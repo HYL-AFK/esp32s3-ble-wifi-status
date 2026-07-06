@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "common/app_config.c"
         "common/cloud_service.c"
+        "common/ota_service.c"
         "common/ui_status.c"
         "drivers/display_st7789.c"
         "drivers/font_gb2312.c"
@@ -22,6 +23,9 @@ idf_component_register(
     REQUIRES
         bt
         esp_http_client
+        app_update
+        esp_app_format
+        esp_partition
         esp_driver_gpio
         esp_driver_spi
         mbedtls

@@ -402,3 +402,48 @@ AA 55 | length(2 LE) | mac(6) | cmd(1) | seq(1) | data(N) | crc16(2 LE) | 55 AA
 缺点：
 - 维护成本最高
 - 调试时不如简单策略直观
+
+## OTA 升级方案
+
+当前工程已接入成熟版 OTA：`manifest.json + HTTPS + HTTP Range + SHA256 + A/B 回滚`。
+
+### OTA manifest
+
+服务器需要提供 JSON：
+
+```json
+{
+  "project": "t1",
+  "chip": "esp32s3",
+  "version": "1.0.1",
+  "url": "https://example.com/firmware/t1-1.0.1.bin",
+  "size": 1536000,
+  "sha256": "64位小写hex",
+  "force": false
+}
+```
+
+校验规则：
+
+- `project` 必须匹配当前固件 `project_name`。
+- `chip` 必须是 `esp32s3`。
+- `url` 必须是 HTTPS。
+- `size` 必须小于 OTA 目标分区大小。
+- `sha256` 必须和下载后 OTA 分区内容一致。
+- 新固件内的 `project_name/version` 必须和 manifest 匹配。
+
+### BLE OTA 命令
+
+- `OTA_START <manifest_url>`：开始 OTA。
+- `OTA_STATUS`：查询 OTA 状态。
+- `OTA_CANCEL`：取消 OTA 并清除断点。
+- `OTA_RESUME`：手动恢复断点。
+- `OTA_REBOOT`：OTA 成功后重启进入新固件。
+
+### 断点续传
+
+OTA 状态保存在 NVS namespace `ota_state`。下载中断后，设备联网时会尝试自动恢复。服务器必须支持 HTTP Range，并在续传请求时返回 `206 Partial Content`。如果服务器不支持 Range，设备会清除旧断点并从头下载。
+
+### 回滚
+
+`sdkconfig.defaults` 已启用 `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`。新固件启动后，主流程初始化成功会调用 `esp_ota_mark_app_valid_cancel_rollback()` 标记固件有效；如果新固件启动失败或未确认，bootloader 会回滚到旧固件。

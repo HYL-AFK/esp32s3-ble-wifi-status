@@ -10,6 +10,7 @@
 #include "cloud_service.h"
 #include "esp_bt.h"
 #include "esp_mac.h"
+#include "ota_service.h"
 #include "wifi_manager.h"
 
 #include "host/ble_gap.h"
@@ -240,6 +241,39 @@ static int build_status_json(char *buf, size_t buf_size)
     if (len < 0 || (size_t)len >= buf_size) {
         APP_LOGW(TAG, "status json build failed");
         return -1;
+    }
+
+    char ota_json[192];
+    int ota_len = ota_service_format_status_json(ota_json, sizeof(ota_json));
+    if (ota_len > 0 && len > 0 && buf[len - 1] == '}') {
+        size_t need = (size_t)len + (size_t)ota_len + 2;
+        if (need >= buf_size) {
+            cloud_service_snapshot_t cloud;
+            cloud_service_get_snapshot(&cloud);
+            len = snprintf(buf,
+                           buf_size,
+                           "{\"sta_connected\":%d,\"internet_ok\":%d,\"sta_ip\":\"%s\",",
+                           cloud.sta_connected ? 1 : 0,
+                           cloud.internet_ok ? 1 : 0,
+                           cloud.sta_ip);
+            if (len <= 0 || (size_t)len >= buf_size) {
+                return -1;
+            }
+            need = (size_t)len + (size_t)ota_len + 2;
+            if (need >= buf_size) {
+                return len;
+            }
+            memcpy(buf + len, ota_json, (size_t)ota_len);
+            len += ota_len;
+            buf[len++] = '}';
+            buf[len] = '\0';
+            return len;
+        }
+        buf[len - 1] = ',';
+        memcpy(buf + len, ota_json, (size_t)ota_len);
+        len += ota_len;
+        buf[len++] = '}';
+        buf[len] = '\0';
     }
     return len;
 }
@@ -561,6 +595,44 @@ static int handle_text_command(char *buf)
             APP_LOGI(TAG, "status: %s", status);
         }
         return 0;
+    }
+
+    if (strncmp(buf, "OTA_START ", 10) == 0) {
+        esp_err_t err = ota_service_start(buf + 10);
+        if (err != ESP_OK) {
+            APP_LOGW(TAG, "OTA_START failed: %s", esp_err_to_name(err));
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        return 0;
+    }
+
+    if (strcmp(buf, "OTA_STATUS") == 0) {
+        char ota_json[224];
+        int len = ota_service_format_status_object_json(ota_json, sizeof(ota_json));
+        if (len <= 0) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        if (s_notify_enabled) {
+            send_frame(BMS_CMD_ACK, 0, (const uint8_t *)ota_json, (uint16_t)len);
+        } else {
+            APP_LOGI(TAG, "ota status: {%s}", ota_json);
+        }
+        return 0;
+    }
+
+    if (strcmp(buf, "OTA_CANCEL") == 0) {
+        esp_err_t err = ota_service_cancel();
+        return (err == ESP_OK) ? 0 : BLE_ATT_ERR_UNLIKELY;
+    }
+
+    if (strcmp(buf, "OTA_RESUME") == 0) {
+        esp_err_t err = ota_service_resume();
+        return (err == ESP_OK) ? 0 : BLE_ATT_ERR_UNLIKELY;
+    }
+
+    if (strcmp(buf, "OTA_REBOOT") == 0) {
+        esp_err_t err = ota_service_reboot_if_ready();
+        return (err == ESP_OK) ? 0 : BLE_ATT_ERR_UNLIKELY;
     }
 
     if (strncmp(buf, "CFG=", 4) == 0) {

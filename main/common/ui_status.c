@@ -11,6 +11,7 @@
 #include "esp_check.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
+#include "ota_service.h"
 #include "wifi_manager.h"
 
 /*
@@ -50,6 +51,8 @@ typedef struct {
     lv_obj_t *cloud_weather;
     lv_obj_t *cloud_time;
     lv_obj_t *cloud_tz;
+    lv_obj_t *ota_state;
+    lv_obj_t *ota_progress;
     lv_timer_t *timer;
     bool ready;
 } ui_status_ctx_t;
@@ -65,11 +68,12 @@ static ui_status_ctx_t s_ui;
 #define UI_RIGHT_X              168
 #define UI_SECTION_W            142
 #define UI_ROW_H                14
-#define UI_CLOUD_ROW1_Y         176
-#define UI_CLOUD_ROW2_Y         188
-#define UI_CLOUD_ROW3_Y         200
-#define UI_CLOUD_ROW4_Y         212
-#define UI_CLOUD_ROW5_Y         224
+#define UI_CLOUD_ROW1_Y         164
+#define UI_CLOUD_ROW2_Y         176
+#define UI_CLOUD_ROW3_Y         188
+#define UI_CLOUD_ROW4_Y         200
+#define UI_CLOUD_ROW5_Y         212
+#define UI_OTA_ROW1_Y           224
 #define UI_CLOUD_FULL_W         300
 
 static void set_label_text(lv_obj_t *obj, const char *fmt, ...)
@@ -222,6 +226,8 @@ static void ui_status_build(void)
     s_ui.cloud_weather = make_label(s_ui.root, 10, UI_CLOUD_ROW3_Y, UI_CLOUD_FULL_W, "", 0xD8E1EA);
     s_ui.cloud_time = make_label(s_ui.root, 10, UI_CLOUD_ROW4_Y, UI_CLOUD_FULL_W, "", 0xD8E1EA);
     s_ui.cloud_tz = make_label(s_ui.root, 10, UI_CLOUD_ROW5_Y, UI_CLOUD_FULL_W, "", 0xD8E1EA);
+    s_ui.ota_state = make_label(s_ui.root, 10, UI_OTA_ROW1_Y, 150, "", 0xD8E1EA);
+    s_ui.ota_progress = make_label(s_ui.root, 168, UI_OTA_ROW1_Y, 142, "", 0xD8E1EA);
 }
 
 static void ui_status_refresh_values(void)
@@ -230,11 +236,13 @@ static void ui_status_refresh_values(void)
     char time_text[32];
     char tz_text[64];
     cloud_service_snapshot_t cloud;
+    ota_service_snapshot_t ota;
     bool sta_connected = wifi_manager_is_sta_connected();
     bool ble_connected = ble_provision_is_connected();
     uint16_t conn_handle = ble_provision_get_conn_handle();
 
     cloud_service_get_snapshot(&cloud);
+    ota_service_get_snapshot(&ota);
 
     set_label_text(s_ui.headline, "%s | %s",
                    sta_connected ? "WIFI OK" : "WIFI IDLE",
@@ -275,6 +283,8 @@ static void ui_status_refresh_values(void)
     set_label_text(s_ui.cloud_time, "TIME: %s", time_text);
     format_timezone_text(&cloud, tz_text, sizeof(tz_text));
     set_label_text(s_ui.cloud_tz, "TZ: %s", tz_text);
+    set_label_text(s_ui.ota_state, "OTA: %s", ota_service_state_to_string(ota.state));
+    set_label_text(s_ui.ota_progress, "OTA PROG: %d%%", ota.progress);
 }
 
 static void ui_status_timer_cb(lv_timer_t *timer)
