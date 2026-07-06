@@ -8,6 +8,8 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "app_log.h"
 
@@ -22,6 +24,17 @@
  */
 
 static const char *TAG = "wifi_manager";
+
+/*
+ * 当前仍然采用“扫描保存列表并选择最强 SSID”的策略。
+ * 下面三个参数只做稳定性防抖：
+ * - 弱信号门槛：优先忽略低于该 RSSI 的候选，除非没有更好的候选。
+ * - 切换门槛：新候选必须明显强于上次成功连接的 SSID，才允许切走。
+ * - 断线延迟：避免 AP 瞬时抖动时马上重扫拿到不完整结果。
+ */
+#define WIFI_WEAK_RSSI_THRESHOLD_DBM   (-82)
+#define WIFI_RSSI_SWITCH_MARGIN_DB     (8)
+#define WIFI_RECONNECT_DELAY_MS        (2000)
 
 static bool s_inited = false;
 static bool s_sta_reconnect_enabled = true;
@@ -41,6 +54,10 @@ static int s_ap_channel = 6;
 static char s_sta_phy[8] = "N/A";
 static wifi_status_cb_t s_status_cb = NULL;
 static app_config_t s_saved_cfg;
+static char s_last_connected_ssid[WIFI_SSID_MAX_LEN + 1] = "";
+static bool s_last_connected_seen_in_scan = false;
+static wifi_ap_record_t s_last_connected_scan_ap;
+static TaskHandle_t s_reconnect_task = NULL;
 /*
  * 统一状态通知入口。
  * 当前主要用于通知 BLE 模块刷新广播 Manufacturer Data 中的状态位。
@@ -51,6 +68,45 @@ static void notify_status_changed(void)
     if (s_status_cb != NULL)
     {
         s_status_cb();
+    }
+}
+
+static void sta_reconnect_task(void *arg)
+{
+    (void)arg;
+
+    vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_DELAY_MS));
+
+    if (s_sta_reconnect_enabled) {
+        if (s_saved_cfg.has_wifi && s_saved_cfg.wifi_count > 0) {
+            APP_LOGI(TAG, "reconnect path: delayed re-evaluate saved wifi profiles");
+            wifi_manager_connect_sta(&s_saved_cfg);
+        } else {
+            APP_LOGI(TAG, "reconnect path: delayed esp_wifi_connect only");
+            esp_wifi_connect();
+        }
+    }
+
+    s_reconnect_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void schedule_sta_reconnect(void)
+{
+    if (s_reconnect_task != NULL) {
+        APP_LOGW(TAG, "STA reconnect already scheduled");
+        return;
+    }
+
+    BaseType_t ok = xTaskCreate(sta_reconnect_task,
+                                "sta_reconn",
+                                4096,
+                                NULL,
+                                5,
+                                &s_reconnect_task);
+    if (ok != pdPASS) {
+        s_reconnect_task = NULL;
+        APP_LOGE(TAG, "create STA reconnect task failed");
     }
 }
 /*
@@ -154,13 +210,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         notify_status_changed();
         if (s_sta_reconnect_enabled)
         {
-            if (s_saved_cfg.has_wifi && s_saved_cfg.wifi_count > 0) {
-                APP_LOGI(TAG, "reconnect path: re-evaluate saved wifi profiles");
-                wifi_manager_connect_sta(&s_saved_cfg);
-            } else {
-                APP_LOGI(TAG, "reconnect path: esp_wifi_connect only");
-                esp_wifi_connect();
-            }
+            APP_LOGI(TAG, "STA reconnect scheduled in %d ms", WIFI_RECONNECT_DELAY_MS);
+            schedule_sta_reconnect();
         }
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START)
@@ -185,6 +236,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         esp_ip4addr_ntoa(&event->ip_info.ip, s_sta_ip_str, sizeof(s_sta_ip_str));
         APP_LOGI(TAG, "STA got IP: %s", s_sta_ip_str);
         refresh_sta_runtime_info(NULL);
+        strlcpy(s_last_connected_ssid, s_sta_ssid, sizeof(s_last_connected_ssid));
         notify_status_changed();
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED)
@@ -359,7 +411,13 @@ static bool find_best_saved_profile(const app_config_t *cfg, wifi_ap_record_t *b
     }
 
     int best_score = INT_MIN;
+    int best_usable_score = INT_MIN;
     bool found = false;
+    bool found_usable = false;
+    wifi_ap_record_t fallback_ap = {0};
+    wifi_profile_t fallback_profile = {0};
+    s_last_connected_seen_in_scan = false;
+    memset(&s_last_connected_scan_ap, 0, sizeof(s_last_connected_scan_ap));
 
     for (int i = 0; i < cfg->wifi_count; ++i)
     {
@@ -375,15 +433,43 @@ static bool find_best_saved_profile(const app_config_t *cfg, wifi_ap_record_t *b
                 continue;
             }
 
+            if (s_last_connected_ssid[0] != '\0' &&
+                strcmp((char *)records[j].ssid, s_last_connected_ssid) == 0)
+            {
+                if (!s_last_connected_seen_in_scan ||
+                    records[j].rssi > s_last_connected_scan_ap.rssi) {
+                    s_last_connected_scan_ap = records[j];
+                }
+                s_last_connected_seen_in_scan = true;
+            }
+
             int score = score_scan_result(&records[j]);
             if (!found || score > best_score)
             {
                 best_score = score;
-                *best_ap = records[j];
-                *best_profile = cfg->wifi_profiles[i];
+                fallback_ap = records[j];
+                fallback_profile = cfg->wifi_profiles[i];
                 found = true;
             }
+
+            if (records[j].rssi >= WIFI_WEAK_RSSI_THRESHOLD_DBM &&
+                (!found_usable || score > best_usable_score))
+            {
+                best_usable_score = score;
+                *best_ap = records[j];
+                *best_profile = cfg->wifi_profiles[i];
+                found_usable = true;
+            }
         }
+    }
+
+    if (!found_usable && found) {
+        APP_LOGW(TAG, "all matched Wi-Fi signals are weak, fallback best SSID=%s RSSI=%d threshold=%d",
+                 fallback_profile.wifi_ssid,
+                 fallback_ap.rssi,
+                 WIFI_WEAK_RSSI_THRESHOLD_DBM);
+        *best_ap = fallback_ap;
+        *best_profile = fallback_profile;
     }
 
     free(records);
@@ -423,6 +509,28 @@ void wifi_manager_connect_sta(const app_config_t *cfg)
 
         APP_LOGW(TAG, "no valid saved wifi profile available");
         return;
+    }
+
+    if (s_last_connected_ssid[0] != '\0' &&
+        s_last_connected_seen_in_scan &&
+        strcmp(best_profile.wifi_ssid, s_last_connected_ssid) != 0 &&
+        best_ap.rssi < s_last_connected_scan_ap.rssi + WIFI_RSSI_SWITCH_MARGIN_DB)
+    {
+        for (int i = 0; i < cfg->wifi_count; ++i) {
+            if (cfg->wifi_profiles[i].valid &&
+                strcmp(cfg->wifi_profiles[i].wifi_ssid, s_last_connected_ssid) == 0) {
+                APP_LOGI(TAG,
+                         "keep previous SSID=%s, candidate=%s rssi=%d previous_rssi=%d margin=%d",
+                         s_last_connected_ssid,
+                         best_profile.wifi_ssid,
+                         best_ap.rssi,
+                         s_last_connected_scan_ap.rssi,
+                         WIFI_RSSI_SWITCH_MARGIN_DB);
+                best_profile = cfg->wifi_profiles[i];
+                best_ap = s_last_connected_scan_ap;
+                break;
+            }
+        }
     }
 
 connect_sta:
@@ -476,6 +584,7 @@ void wifi_manager_disconnect_sta(void)
     s_sta_channel = 0;
     strlcpy(s_sta_phy, "N/A", sizeof(s_sta_phy));
     s_sta_ssid[0] = '\0';
+    s_last_connected_ssid[0] = '\0';
     strlcpy(s_sta_ip_str, "0.0.0.0", sizeof(s_sta_ip_str));
     esp_wifi_disconnect();
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &(wifi_config_t){0}));
