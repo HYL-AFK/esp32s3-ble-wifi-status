@@ -1,943 +1,642 @@
 #include "ble_provision.h"
 
+#include <inttypes.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
-#include "app_config.h"
 #include "app_log.h"
-#include "cloud_service.h"
+#include "blufi_security.h"
+#include "esp_blufi.h"
+#include "esp_blufi_api.h"
 #include "esp_bt.h"
+#include "esp_event.h"
 #include "esp_mac.h"
-#include "ota_service.h"
-#include "wifi_manager.h"
-
-#include "host/ble_gap.h"
-#include "host/ble_gatt.h"
-#include "host/ble_hs.h"
-#include "host/ble_uuid.h"
-#include "host/util/util.h"
-#include "nimble/ble.h"
+#include "esp_wifi.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
-#include "os/os_mbuf.h"
+#include "host/ble_hs.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
-
-/*
- * BLE 配网中间层。
- *
- * 职责：
- * - 启动 NimBLE Host。
- * - 注册自定义 GATT 服务 FFF0。
- * - 通过 FFF1 接收手机写入的配置命令。
- * - 通过 FFF2 Notify 返回二进制 ACK/ERR 或状态。
- * - 维护 BLE 广播名、Manufacturer Data 和状态位。
- *
- * 当前同时兼容两套协议：
- * 1. 文本命令：方便手机蓝牙调试助手手工测试，例如 CFG=ssid,password。
- * 2. 二进制帧：正式 App 推荐使用，支持拆包组包、MAC 校验和 CRC16。
- */
+#include "store/config/ble_store_config.h"
+#include "wifi_manager.h"
 
 static const char *TAG = "ble_provision";
 
-/* GATT UUID：FFF0 是服务，FFF1 写命令，FFF2 发通知。 */
-#define BLE_SERVICE_UUID       0xFFF0
-#define BLE_CHAR_CMD_UUID      0xFFF1
-#define BLE_CHAR_NOTIFY_UUID   0xFFF2
+void ble_store_config_init(void);
 
-/*
- * 二进制帧格式：
- * Header(AA55) + Length(2 LE) + MAC(6) + Cmd(1) + Seq(1) + Data(N) + CRC16(2 LE) + Footer(55AA)
- *
- * Length 只包含 MAC + Cmd + Seq + Data，不包含 Header/Length/CRC/Footer。
- * CRC16 计算范围是 Length 字段到 Data 结束。
- */
-#define BMS_FRAME_HEADER_0     0xAA
-#define BMS_FRAME_HEADER_1     0x55
-#define BMS_FRAME_FOOTER_0     0x55
-#define BMS_FRAME_FOOTER_1     0xAA
-#define BMS_FRAME_MIN_LEN      14
-#define BMS_FRAME_MAX_PAYLOAD  512
-#define BMS_RX_BUFFER_SIZE     640
-#define BMS_TX_FRAME_MAX_LEN   (2 + 2 + 6 + 1 + 1 + BMS_FRAME_MAX_PAYLOAD + 2 + 2)
-#define BMS_GATT_WRITE_MAX_LEN BMS_RX_BUFFER_SIZE
-
-/* 二进制帧命令字。文本协议也尽量和这些语义保持一致。 */
-#define BMS_CMD_SET_WIFI       0x01
-#define BMS_CMD_SET_BLE_NAME   0x02
-#define BMS_CMD_SET_AP_NAME    0x03
-#define BMS_CMD_SET_AP_PASS    0x04
-#define BMS_CMD_CLEAR_WIFI     0x05
-#define BMS_CMD_QUERY_STATUS   0x06
-#define BMS_CMD_ACK            0x80
-#define BMS_CMD_ERR            0x81
-
-/*
- * 广播 Manufacturer Data，共 8 字节：
- * Byte0-1: 42 4D，ASCII "BM"
- * Byte2:   产品类型
- * Byte3:   协议版本
- * Byte4-6: BLE MAC 后 3 字节
- * Byte7:   状态位 flags
- */
-#define BMS_MFG_PRODUCT_TYPE   0x01
-#define BMS_MFG_PROTOCOL_VER   0x01
-#define BMS_ADV_FLAG_HAS_WIFI  0x01
-#define BMS_ADV_FLAG_STA_CONN  0x02
-#define BMS_ADV_FLAG_CFG_EN    0x04
-#define BMS_ADV_FLAG_FAULT     0x08
-#define BMS_ADV_FLAG_AP_ON     0x10
+#define BLE_FIXED_ADV_NAME "ESPARK-PowerGo"
+#define BLUFI_SCAN_LIST_MAX_AP 20
 
 static app_config_t s_cfg;
 static ble_cfg_apply_cb_t s_apply_cb;
-static uint8_t s_own_addr_type;
-static uint8_t s_device_mac[6];
-static char s_adv_name[BLE_NAME_MAX_LEN + 1];
-static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t s_cmd_handle;
-static uint16_t s_notify_handle;
+static bool s_ready;
+static bool s_advertising;
+static bool s_connected;
 static bool s_notify_enabled;
-static bool s_ble_synced;
-static bool s_adv_restart_pending;
-static bool s_binary_response_sent;
-static uint8_t s_rx_buffer[BMS_RX_BUFFER_SIZE];
-static uint8_t s_gatt_write_buffer[BMS_GATT_WRITE_MAX_LEN];
-static char s_text_cmd_buffer[BMS_GATT_WRITE_MAX_LEN + 1];
-static size_t s_rx_len;
+static bool s_sta_connecting;
+static bool s_wifi_event_registered;
+static bool s_scan_in_progress;
+static bool s_wifi_list_requested;
+static bool s_pending_sta_bssid_set;
+static uint16_t s_conn_handle = 0xFFFF;
+static uint8_t s_pending_sta_bssid[6];
+static uint8_t s_last_sta_bssid[6];
+static bool s_last_sta_bssid_set;
+static uint8_t s_last_sta_reason = 0xff;
+static int8_t s_last_sta_rssi = -128;
+static char s_adv_name[BLE_NAME_MAX_LEN + 1];
+static char s_pending_sta_ssid[WIFI_SSID_MAX_LEN + 1];
+static char s_pending_sta_pass[WIFI_PASS_MAX_LEN + 1];
 
-static const ble_uuid16_t s_service_uuid = BLE_UUID16_INIT(BLE_SERVICE_UUID);
-static const ble_uuid16_t s_cmd_uuid = BLE_UUID16_INIT(BLE_CHAR_CMD_UUID);
-static const ble_uuid16_t s_notify_uuid = BLE_UUID16_INIT(BLE_CHAR_NOTIFY_UUID);
-
-static void ble_start_advertising(void);
-static void ble_restart_advertising(void);
-
-static uint16_t read_le16(const uint8_t *p)
+static const char *blufi_error_to_str(esp_blufi_error_state_t state)
 {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static void write_le16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v & 0xff);
-    p[1] = (uint8_t)(v >> 8);
-}
-
-static uint16_t crc16_ccitt_false(const uint8_t *data, size_t len)
-{
-    uint16_t crc = 0xffff;
-
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-        }
-    }
-
-    return crc;
-}
-
-static void make_bms_adv_name(void)
-{
-    /*
-     * 产品化广播名固定为 BMS + BLE MAC 后 3 字节。
-     * 例如 BLE MAC=1C:DB:D4:BC:7E:62，广播名就是 BMSBC7E62。
-     *
-     * 这样 App 可以稳定按 BMS 前缀和 MAC 后缀过滤设备。
-     * 用户通过 NAME 命令设置的名字只作为“显示名”保存，不覆盖这里的扫描名。
-     */
-    esp_read_mac(s_device_mac, ESP_MAC_BT);
-    snprintf(s_adv_name, sizeof(s_adv_name), "BMS%02X%02X%02X",
-             s_device_mac[3], s_device_mac[4], s_device_mac[5]);
-}
-
-static uint8_t build_adv_status_flags(void)
-{
-    /*
-     * 广播状态位：
-     * bit0: 已保存 STA Wi-Fi
-     * bit1: STA 已连接
-     * bit2: 允许 BLE 配置
-     * bit4: AP 已开启
-     */
-    uint8_t flags = BMS_ADV_FLAG_CFG_EN;
-
-    if (s_cfg.has_wifi && s_cfg.wifi_count > 0) {
-        flags |= BMS_ADV_FLAG_HAS_WIFI;
-    }
-
-    if (wifi_manager_is_sta_connected()) {
-        flags |= BMS_ADV_FLAG_STA_CONN;
-    }
-
-    if (wifi_manager_is_ap_started()) {
-        flags |= BMS_ADV_FLAG_AP_ON;
-    }
-
-    return flags;
-}
-
-static void send_frame(uint8_t cmd, uint8_t seq, const uint8_t *data, uint16_t data_len)
-{
-    /*
-     * 通过 FFF2 Notify 发送二进制帧。
-     * 当前栈会按 ATT/MTU 自动拆成 BLE 空口包；上层看到的是一条 Notify 数据。
-     */
-    if (!s_notify_enabled || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-        return;
-    }
-
-    uint16_t payload_len = 6 + 1 + 1 + data_len;
-    uint16_t frame_len = 2 + 2 + payload_len + 2 + 2;
-    uint8_t frame[BMS_TX_FRAME_MAX_LEN];
-    if (frame_len > sizeof(frame)) {
-        APP_LOGW(TAG, "tx frame too large: %u", (unsigned)frame_len);
-        return;
-    }
-
-    frame[0] = BMS_FRAME_HEADER_0;
-    frame[1] = BMS_FRAME_HEADER_1;
-    write_le16(&frame[2], payload_len);
-    memcpy(&frame[4], s_device_mac, sizeof(s_device_mac));
-    frame[10] = cmd;
-    frame[11] = seq;
-    if (data_len > 0 && data != NULL) {
-        memcpy(&frame[12], data, data_len);
-    }
-
-    uint16_t crc = crc16_ccitt_false(&frame[2], 2 + payload_len);
-    write_le16(&frame[12 + data_len], crc);
-    frame[14 + data_len] = BMS_FRAME_FOOTER_0;
-    frame[15 + data_len] = BMS_FRAME_FOOTER_1;
-
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, frame_len);
-    if (om != NULL) {
-        int rc = ble_gatts_notify_custom(s_conn_handle, s_notify_handle, om);
-        if (rc != 0) {
-            APP_LOGW(TAG, "notify failed: %d", rc);
-        } else {
-            APP_LOGI(TAG, "notify frame cmd=0x%02X seq=%u len=%u", cmd, seq, (unsigned)frame_len);
-        }
-    } else {
-        APP_LOGW(TAG, "ble_hs_mbuf_from_flat failed, len=%u", (unsigned)frame_len);
-    }
-}
-
-static void send_ack(uint8_t seq, uint8_t source_cmd)
-{
-    send_frame(BMS_CMD_ACK, seq, &source_cmd, 1);
-}
-
-static void send_err(uint8_t seq, uint8_t source_cmd)
-{
-    send_frame(BMS_CMD_ERR, seq, &source_cmd, 1);
-}
-
-static int build_status_json(char *buf, size_t buf_size)
-{
-    int len = cloud_service_format_status_json(buf, buf_size);
-    if (len < 0 || (size_t)len >= buf_size) {
-        APP_LOGW(TAG, "status json build failed");
-        return -1;
-    }
-
-    char ota_json[192];
-    int ota_len = ota_service_format_status_json(ota_json, sizeof(ota_json));
-    if (ota_len > 0 && len > 0 && buf[len - 1] == '}') {
-        size_t need = (size_t)len + (size_t)ota_len + 2;
-        if (need >= buf_size) {
-            cloud_service_snapshot_t cloud;
-            cloud_service_get_snapshot(&cloud);
-            len = snprintf(buf,
-                           buf_size,
-                           "{\"sta_connected\":%d,\"internet_ok\":%d,\"sta_ip\":\"%s\",",
-                           cloud.sta_connected ? 1 : 0,
-                           cloud.internet_ok ? 1 : 0,
-                           cloud.sta_ip);
-            if (len <= 0 || (size_t)len >= buf_size) {
-                return -1;
-            }
-            need = (size_t)len + (size_t)ota_len + 2;
-            if (need >= buf_size) {
-                return len;
-            }
-            memcpy(buf + len, ota_json, (size_t)ota_len);
-            len += ota_len;
-            buf[len++] = '}';
-            buf[len] = '\0';
-            return len;
-        }
-        buf[len - 1] = ',';
-        memcpy(buf + len, ota_json, (size_t)ota_len);
-        len += ota_len;
-        buf[len++] = '}';
-        buf[len] = '\0';
-    }
-    return len;
-}
-
-static bool parse_len_string(const uint8_t *data, uint16_t data_len, uint16_t *offset, char *out, size_t out_size)
-{
-    /*
-     * 二进制 Data 中的字符串格式：
-     * len(1 byte) + utf8/ascii bytes
-     *
-     * 这样 SSID、密码、中文显示名里包含逗号时也不会影响解析。
-     */
-    if (*offset >= data_len || out_size == 0) {
-        return false;
-    }
-
-    uint8_t len = data[*offset];
-    (*offset)++;
-    if (*offset + len > data_len || len >= out_size) {
-        return false;
-    }
-
-    memcpy(out, &data[*offset], len);
-    out[len] = '\0';
-    *offset += len;
-    return true;
-}
-
-static bool apply_binary_command(uint8_t cmd, uint8_t seq, const uint8_t *data, uint16_t data_len)
-{
-    /*
-     * 二进制命令分发入口。
-     * 这里只处理“命令语义”，帧头、长度、MAC、CRC 校验已经在 process_binary_rx() 完成。
-     */
-    char ssid[WIFI_SSID_MAX_LEN + 1];
-    char pass[WIFI_PASS_MAX_LEN + 1];
-    char name[BLE_NAME_MAX_LEN + 1];
-    char ap_name[AP_NAME_MAX_LEN + 1];
-    char ap_pass[AP_PASS_MAX_LEN + 1];
-    uint16_t offset = 0;
-
-    switch (cmd) {
-    case BMS_CMD_SET_WIFI:
-        if (!parse_len_string(data, data_len, &offset, ssid, sizeof(ssid)) ||
-            !parse_len_string(data, data_len, &offset, pass, sizeof(pass))) {
-            return false;
-        }
-        if (!app_config_add_or_update_wifi(&s_cfg, ssid, pass)) {
-            return false;
-        }
-        app_config_save(&s_cfg);
-        if (s_apply_cb != NULL) {
-            s_apply_cb(&s_cfg);
-        }
-        return true;
-
-    case BMS_CMD_SET_BLE_NAME:
-        offset = 0;
-        if (!parse_len_string(data, data_len, &offset, name, sizeof(name))) {
-            return false;
-        }
-        /*
-         * 这里保存的是用户显示名，例如 BMS-ble。
-         * 广播发现名仍固定为 BMSxxxxxx，便于 App 按 BMS + MAC 后缀稳定过滤设备。
-         */
-        strlcpy(s_cfg.ble_name, name, sizeof(s_cfg.ble_name));
-        s_cfg.has_ble_name = true;
-        app_config_save(&s_cfg);
-        ble_svc_gap_device_name_set(s_adv_name);
-        ble_restart_advertising();
-        return true;
-
-    case BMS_CMD_SET_AP_NAME:
-        offset = 0;
-        if (!parse_len_string(data, data_len, &offset, ap_name, sizeof(ap_name))) {
-            return false;
-        }
-        strlcpy(s_cfg.ap_name, ap_name, sizeof(s_cfg.ap_name));
-        s_cfg.has_ap_name = true;
-        app_config_save(&s_cfg);
-        if (s_apply_cb != NULL) {
-            s_apply_cb(&s_cfg);
-        }
-        return true;
-
-    case BMS_CMD_SET_AP_PASS:
-        offset = 0;
-        if (!parse_len_string(data, data_len, &offset, ap_pass, sizeof(ap_pass)) || strlen(ap_pass) < 8) {
-            return false;
-        }
-        strlcpy(s_cfg.ap_pass, ap_pass, sizeof(s_cfg.ap_pass));
-        s_cfg.has_ap_pass = true;
-        app_config_save(&s_cfg);
-        wifi_manager_set_ap_password(s_cfg.ap_pass);
-        return true;
-
-    case BMS_CMD_CLEAR_WIFI:
-        app_config_erase_wifi();
-        s_cfg.has_wifi = false;
-        s_cfg.wifi_count = 0;
-        memset(s_cfg.wifi_profiles, 0, sizeof(s_cfg.wifi_profiles));
-        app_config_save(&s_cfg);
-        wifi_manager_disconnect_sta();
-        return true;
-
-    case BMS_CMD_QUERY_STATUS: {
-        char status[512];
-        int len = build_status_json(status, sizeof(status));
-        if (len < 0) {
-            return false;
-        }
-        send_frame(BMS_CMD_ACK, seq, (const uint8_t *)status, (uint16_t)len);
-        s_binary_response_sent = true;
-        return true;
-    }
-
+    switch (state) {
+    case ESP_BLUFI_SEQUENCE_ERROR:
+        return "SEQUENCE";
+    case ESP_BLUFI_CHECKSUM_ERROR:
+        return "CHECKSUM";
+    case ESP_BLUFI_DECRYPT_ERROR:
+        return "DECRYPT";
+    case ESP_BLUFI_ENCRYPT_ERROR:
+        return "ENCRYPT";
+    case ESP_BLUFI_INIT_SECURITY_ERROR:
+        return "INIT_SECURITY";
+    case ESP_BLUFI_DH_MALLOC_ERROR:
+        return "DH_MALLOC";
+    case ESP_BLUFI_DH_PARAM_ERROR:
+        return "DH_PARAM";
+    case ESP_BLUFI_READ_PARAM_ERROR:
+        return "READ_PARAM";
+    case ESP_BLUFI_MAKE_PUBLIC_ERROR:
+        return "MAKE_PUBLIC";
+    case ESP_BLUFI_DATA_FORMAT_ERROR:
+        return "DATA_FORMAT";
+    case ESP_BLUFI_CALC_MD5_ERROR:
+        return "CALC_MD5";
+    case ESP_BLUFI_WIFI_SCAN_FAIL:
+        return "WIFI_SCAN";
+    case ESP_BLUFI_MSG_STATE_ERROR:
+        return "MSG_STATE";
     default:
-        return false;
+        return "UNKNOWN";
     }
 }
 
-static void consume_rx_bytes(size_t count)
+static void blufi_host_task(void *param)
 {
-    if (count >= s_rx_len) {
-        s_rx_len = 0;
-        return;
-    }
-
-    memmove(s_rx_buffer, s_rx_buffer + count, s_rx_len - count);
-    s_rx_len -= count;
-}
-
-static void process_binary_rx(void)
-{
-    /*
-     * 二进制拆包组包状态机。
-     *
-     * BLE GATT 单次写入可能只有 20 字节，也可能协商 MTU 后更大；
-     * 因此这里把每次写入都当作“字节流片段”，追加到 s_rx_buffer 后再尝试解析完整帧。
-     */
-    while (s_rx_len >= BMS_FRAME_MIN_LEN) {
-        size_t header_pos = 0;
-        while (header_pos + 1 < s_rx_len &&
-               !(s_rx_buffer[header_pos] == BMS_FRAME_HEADER_0 && s_rx_buffer[header_pos + 1] == BMS_FRAME_HEADER_1)) {
-            header_pos++;
-        }
-
-        if (header_pos > 0) {
-            consume_rx_bytes(header_pos);
-        }
-        if (s_rx_len < BMS_FRAME_MIN_LEN) {
-            return;
-        }
-        if (s_rx_buffer[0] != BMS_FRAME_HEADER_0 || s_rx_buffer[1] != BMS_FRAME_HEADER_1) {
-            consume_rx_bytes(1);
-            continue;
-        }
-
-        uint16_t payload_len = read_le16(&s_rx_buffer[2]);
-        if (payload_len < 8 || payload_len > (6 + 1 + 1 + BMS_FRAME_MAX_PAYLOAD)) {
-            consume_rx_bytes(1);
-            continue;
-        }
-
-        size_t frame_len = 2 + 2 + payload_len + 2 + 2;
-        if (s_rx_len < frame_len) {
-            return;
-        }
-
-        if (s_rx_buffer[frame_len - 2] != BMS_FRAME_FOOTER_0 || s_rx_buffer[frame_len - 1] != BMS_FRAME_FOOTER_1) {
-            consume_rx_bytes(1);
-            continue;
-        }
-
-        uint16_t recv_crc = read_le16(&s_rx_buffer[4 + payload_len]);
-        uint16_t calc_crc = crc16_ccitt_false(&s_rx_buffer[2], 2 + payload_len);
-        if (recv_crc != calc_crc) {
-            APP_LOGW(TAG, "drop frame: crc mismatch recv=0x%04X calc=0x%04X", recv_crc, calc_crc);
-            consume_rx_bytes(1);
-            continue;
-        }
-
-        uint8_t *payload = &s_rx_buffer[4];
-        uint8_t cmd = payload[6];
-        uint8_t seq = payload[7];
-        uint8_t *data = &payload[8];
-        uint16_t data_len = payload_len - 8;
-
-        if (memcmp(payload, s_device_mac, sizeof(s_device_mac)) != 0) {
-            APP_LOGW(TAG, "drop frame: mac mismatch dst=%02X:%02X:%02X:%02X:%02X:%02X",
-                     payload[0], payload[1], payload[2], payload[3], payload[4], payload[5]);
-            consume_rx_bytes(frame_len);
-            continue;
-        }
-
-        APP_LOGI(TAG, "rx frame cmd=0x%02X seq=%u payload_len=%u data_len=%u",
-                 cmd, seq, payload_len, data_len);
-        s_binary_response_sent = false;
-        bool ok = apply_binary_command(cmd, seq, data, data_len);
-        if (ok) {
-            if (!s_binary_response_sent) {
-                send_ack(seq, cmd);
-            }
-        } else {
-            send_err(seq, cmd);
-        }
-
-        consume_rx_bytes(frame_len);
-    }
-}
-
-static void append_binary_rx(const uint8_t *data, size_t len)
-{
-    /*
-     * 追加一段 GATT 写入数据。
-     * 如果缓冲区溢出，直接清空并等待下一次从帧头重新同步。
-     */
-    if (len > sizeof(s_rx_buffer)) {
-        s_rx_len = 0;
-        return;
-    }
-
-    if (s_rx_len + len > sizeof(s_rx_buffer)) {
-        s_rx_len = 0;
-    }
-
-    memcpy(s_rx_buffer + s_rx_len, data, len);
-    s_rx_len += len;
-    process_binary_rx();
-}
-
-static int handle_text_command(char *buf)
-{
-    /*
-     * 文本命令入口，主要用于蓝牙调试助手手工测试。
-     *
-     * 支持格式：
-     * - CFG=ssid,password      保存 STA Wi-Fi 并触发连接
-     * - NAME=xxx               保存用户显示名，不改 BLE 广播名
-     * - APNAME=xxx             修改 SoftAP 名称
-     * - APPASS=xxxxxxxx        修改 SoftAP 密码，至少 8 位
-     * - CLEAR_WIFI             只清空 STA Wi-Fi
-     * - CLEAR                  清空全部应用配置
-     */
-    APP_LOGI(TAG, "text cmd: %s", buf);
-
-    if (strncmp(buf, "NAME=", 5) == 0) {
-        /* NAME 命令只修改用户显示名，不修改广播 Local Name。 */
-        strlcpy(s_cfg.ble_name, buf + 5, sizeof(s_cfg.ble_name));
-        s_cfg.has_ble_name = true;
-        app_config_save(&s_cfg);
-        ble_svc_gap_device_name_set(s_adv_name);
-        ble_restart_advertising();
-        return 0;
-    }
-
-    if (strncmp(buf, "APNAME=", 7) == 0) {
-        strlcpy(s_cfg.ap_name, buf + 7, sizeof(s_cfg.ap_name));
-        s_cfg.has_ap_name = true;
-        app_config_save(&s_cfg);
-        if (s_apply_cb != NULL) {
-            s_apply_cb(&s_cfg);
-        }
-        return 0;
-    }
-
-    if (strncmp(buf, "APPASS=", 7) == 0) {
-        const char *pass = buf + 7;
-        if (strlen(pass) < 8) {
-            APP_LOGW(TAG, "AP password too short");
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-        strlcpy(s_cfg.ap_pass, pass, sizeof(s_cfg.ap_pass));
-        s_cfg.has_ap_pass = true;
-        app_config_save(&s_cfg);
-        wifi_manager_set_ap_password(s_cfg.ap_pass);
-        return 0;
-    }
-
-    if (strcmp(buf, "CLEAR") == 0) {
-        app_config_erase_all();
-        app_config_set_default(&s_cfg);
-        make_bms_adv_name();
-        app_config_save(&s_cfg);
-        wifi_manager_disconnect_sta();
-        if (s_apply_cb != NULL) {
-            s_apply_cb(&s_cfg);
-        }
-        ble_svc_gap_device_name_set(s_adv_name);
-        ble_restart_advertising();
-        return 0;
-    }
-
-    if (strcmp(buf, "CLEAR_WIFI") == 0) {
-        app_config_erase_wifi();
-        s_cfg.has_wifi = false;
-        s_cfg.wifi_count = 0;
-        memset(s_cfg.wifi_profiles, 0, sizeof(s_cfg.wifi_profiles));
-        app_config_save(&s_cfg);
-        wifi_manager_disconnect_sta();
-        return 0;
-    }
-
-    if (strcmp(buf, "REFRESH_CLOUD") == 0) {
-        cloud_service_request_refresh();
-        return 0;
-    }
-
-    if (strcmp(buf, "STATUS") == 0) {
-        char status[512];
-        int len = build_status_json(status, sizeof(status));
-        if (len <= 0) {
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-
-        if (s_notify_enabled) {
-            send_frame(BMS_CMD_ACK, 0, (const uint8_t *)status, (uint16_t)len);
-        } else {
-            APP_LOGI(TAG, "status: %s", status);
-        }
-        return 0;
-    }
-
-    if (strncmp(buf, "OTA_START ", 10) == 0) {
-        esp_err_t err = ota_service_start(buf + 10);
-        if (err != ESP_OK) {
-            APP_LOGW(TAG, "OTA_START failed: %s", esp_err_to_name(err));
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-        return 0;
-    }
-
-    if (strcmp(buf, "OTA_STATUS") == 0) {
-        char ota_json[224];
-        int len = ota_service_format_status_object_json(ota_json, sizeof(ota_json));
-        if (len <= 0) {
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-        if (s_notify_enabled) {
-            send_frame(BMS_CMD_ACK, 0, (const uint8_t *)ota_json, (uint16_t)len);
-        } else {
-            APP_LOGI(TAG, "ota status: {%s}", ota_json);
-        }
-        return 0;
-    }
-
-    if (strcmp(buf, "OTA_CANCEL") == 0) {
-        esp_err_t err = ota_service_cancel();
-        return (err == ESP_OK) ? 0 : BLE_ATT_ERR_UNLIKELY;
-    }
-
-    if (strcmp(buf, "OTA_RESUME") == 0) {
-        esp_err_t err = ota_service_resume();
-        return (err == ESP_OK) ? 0 : BLE_ATT_ERR_UNLIKELY;
-    }
-
-    if (strcmp(buf, "OTA_REBOOT") == 0) {
-        esp_err_t err = ota_service_reboot_if_ready();
-        return (err == ESP_OK) ? 0 : BLE_ATT_ERR_UNLIKELY;
-    }
-
-    if (strncmp(buf, "CFG=", 4) == 0) {
-        char *payload = buf + 4;
-        char *ssid = strtok(payload, ",");
-        char *pass = strtok(NULL, ",");
-
-        if (app_config_add_or_update_wifi(&s_cfg, ssid, pass)) {
-            app_config_save(&s_cfg);
-            if (s_apply_cb != NULL) {
-                s_apply_cb(&s_cfg);
-            }
-            return 0;
-        }
-    }
-
-    return BLE_ATT_ERR_UNLIKELY;
-}
-
-static int ble_access_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg)
-{
-    /*
-     * GATT 特征访问回调。
-     * 手机向 FFF1 写入时会进入这里：
-     * - 如果数据以 AA 55 开头，按二进制帧处理。
-     * - 否则按文本命令处理。
-     */
-    (void)conn_handle;
-    (void)arg;
-
-    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && attr_handle == s_cmd_handle) {
-        int len = OS_MBUF_PKTLEN(ctxt->om);
-        if (len <= 0 || len > (int)sizeof(s_gatt_write_buffer)) {
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-
-        os_mbuf_copydata(ctxt->om, 0, len, s_gatt_write_buffer);
-
-        if (len >= 2 && s_gatt_write_buffer[0] == BMS_FRAME_HEADER_0 && s_gatt_write_buffer[1] == BMS_FRAME_HEADER_1) {
-            append_binary_rx(s_gatt_write_buffer, (size_t)len);
-            return 0;
-        }
-
-        memcpy(s_text_cmd_buffer, s_gatt_write_buffer, (size_t)len);
-        s_text_cmd_buffer[len] = '\0';
-        return handle_text_command(s_text_cmd_buffer);
-    }
-
-    return BLE_ATT_ERR_UNLIKELY;
-}
-
-static const struct ble_gatt_chr_def s_chr_defs[] = {
-    {
-        .uuid = &s_cmd_uuid.u,
-        .access_cb = ble_access_cb,
-        .flags = BLE_GATT_CHR_F_WRITE,
-        .val_handle = &s_cmd_handle,
-    },
-    {
-        .uuid = &s_notify_uuid.u,
-        .access_cb = ble_access_cb,
-        .flags = BLE_GATT_CHR_F_NOTIFY,
-        .val_handle = &s_notify_handle,
-    },
-    { 0 }
-};
-
-static const struct ble_gatt_svc_def s_svc_defs[] = {
-    {
-        .type = BLE_GATT_SVC_TYPE_PRIMARY,
-        .uuid = &s_service_uuid.u,
-        .characteristics = s_chr_defs,
-    },
-    { 0 }
-};
-
-static int ble_gap_event(struct ble_gap_event *event, void *arg)
-{
-    /*
-     * GAP 事件回调。
-     * 连接、断开、Notify 订阅状态、广播结束都会从这里进入。
-     */
-    (void)arg;
-
-    switch (event->type) {
-    case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0) {
-            s_conn_handle = event->connect.conn_handle;
-            s_rx_len = 0;
-        } else {
-            ble_start_advertising();
-        }
-        return 0;
-
-    case BLE_GAP_EVENT_DISCONNECT:
-        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        s_notify_enabled = false;
-        s_rx_len = 0;
-        ble_start_advertising();
-        return 0;
-
-    case BLE_GAP_EVENT_SUBSCRIBE:
-        if (event->subscribe.attr_handle == s_notify_handle) {
-            s_notify_enabled = event->subscribe.cur_notify;
-        }
-        return 0;
-
-    case BLE_GAP_EVENT_ADV_COMPLETE:
-        if (s_adv_restart_pending) {
-            s_adv_restart_pending = false;
-        }
-        ble_start_advertising();
-        return 0;
-
-    default:
-        return 0;
-    }
-}
-
-static void ble_start_advertising(void)
-{
-    /*
-     * 启动 BLE 广播。
-     *
-     * 广播内容：
-     * - Local Name: BMSxxxxxx
-     * - Service UUID: FFF0
-     * - Manufacturer Data: BM + 产品类型 + 协议版本 + MAC 后缀 + 状态位
-     */
-    struct ble_hs_adv_fields fields = { 0 };
-    struct ble_gap_adv_params adv_params = { 0 };
-    // Manufacturer Data:
-    // 42 4D("BM") + 产品类型 + 协议版本 + MAC 后 3 字节 + 状态位。
-    uint8_t mfg_data[8] = {
-        0x42,
-        0x4d,
-        BMS_MFG_PRODUCT_TYPE,
-        BMS_MFG_PROTOCOL_VER,
-        s_device_mac[3],
-        s_device_mac[4],
-        s_device_mac[5],
-        build_adv_status_flags(),
-    };
-
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.name = (uint8_t *)s_adv_name;
-    fields.name_len = strlen(s_adv_name);
-    fields.name_is_complete = 1;
-    fields.uuids16 = &s_service_uuid;
-    fields.num_uuids16 = 1;
-    fields.uuids16_is_complete = 1;
-    fields.mfg_data = mfg_data;
-    fields.mfg_data_len = sizeof(mfg_data);
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-
-    if (ble_gap_adv_active()) {
-        return;
-    }
-
-    int rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_adv_set_fields failed: %d", rc);
-        return;
-    }
-
-    /*
-     * 这里明确使用 legacy ADV_IND：
-     * - BLE_GAP_CONN_MODE_UND：可连接、非定向广播。
-     * - direct_addr = NULL：不指定中心设备地址，确认不是定向广播。
-     * - BLE_GAP_DISC_MODE_GEN：通用可发现，手机蓝牙调试助手可以扫描到。
-     */
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event, NULL);
-    if (rc != 0) {
-        APP_LOGE(TAG, "ble_gap_adv_start ADV_IND failed: %d", rc);
-    } else {
-        APP_LOGI(TAG, "advertising start ok, name=%s flags=0x%02X", s_adv_name, build_adv_status_flags());
-    }
-}
-
-static void ble_restart_advertising(void)
-{
-    /*
-     * 安全刷新广播。
-     *
-     * NimBLE 的 stop advertising 是 GAP 流程，不能在广播 active 时 stop 后立刻 start，
-     * 否则容易触发 ble_gap_adv_start 返回 2 这类状态冲突错误。
-     *
-     * 做法：
-     * - 连接中：不重启广播，避免影响当前 BLE 配置连接。
-     * - 正在广播：先 stop，并标记 s_adv_restart_pending，等 ADV_COMPLETE 再 start。
-     * - 未广播：直接 start。
-     */
-    if (!s_ble_synced || s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        return;
-    }
-
-    if (ble_gap_adv_active()) {
-        APP_LOGI(TAG, "advertising already active, keep current ADV");
-        return;
-    }
-
-    ble_start_advertising();
-}
-
-static void ble_stack_reset(int reason)
-{
-    APP_LOGW(TAG, "nimble reset: %d", reason);
-}
-
-static void ble_stack_sync(void)
-{
-    /*
-     * NimBLE Host 同步完成后触发。
-     * 只有到这里以后，才能安全设置 GAP 名称并启动广播。
-     */
-    ble_hs_id_infer_auto(0, &s_own_addr_type);
-    make_bms_adv_name();
-    s_ble_synced = true;
-    ble_svc_gap_device_name_set(s_adv_name);
-    ble_start_advertising();
-}
-
-static void ble_host_task(void *param)
-{
-    /* NimBLE Host 线程入口。nimble_port_run() 会一直运行，直到协议栈停止。 */
     (void)param;
     nimble_port_run();
     nimble_port_freertos_deinit();
 }
 
+static void make_fixed_adv_name(void)
+{
+    strlcpy(s_adv_name, BLE_FIXED_ADV_NAME, sizeof(s_adv_name));
+}
+
+static int softap_get_current_connection_number(void)
+{
+    wifi_sta_list_t sta_list;
+    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
+        return sta_list.num;
+    }
+    return 0;
+}
+
+static void build_blufi_conn_info(esp_blufi_extra_info_t *info)
+{
+    memset(info, 0, sizeof(*info));
+
+    const char *sta_ssid = wifi_manager_get_sta_ssid();
+    if (sta_ssid[0] != '\0') {
+        info->sta_ssid = (uint8_t *)sta_ssid;
+        info->sta_ssid_len = (int)strlen(sta_ssid);
+    } else if (s_pending_sta_ssid[0] != '\0') {
+        info->sta_ssid = (uint8_t *)s_pending_sta_ssid;
+        info->sta_ssid_len = (int)strlen(s_pending_sta_ssid);
+    }
+
+    uint8_t bssid[6];
+    if (wifi_manager_get_sta_bssid(bssid)) {
+        memcpy(info->sta_bssid, bssid, sizeof(info->sta_bssid));
+        info->sta_bssid_set = true;
+    } else if (s_last_sta_bssid_set) {
+        memcpy(info->sta_bssid, s_last_sta_bssid, sizeof(info->sta_bssid));
+        info->sta_bssid_set = true;
+    }
+
+    if (wifi_manager_is_sta_connected()) {
+        info->sta_conn_rssi_set = true;
+        info->sta_conn_rssi = (int8_t)wifi_manager_get_sta_rssi();
+    } else if (s_last_sta_rssi != -128) {
+        info->sta_conn_rssi_set = true;
+        info->sta_conn_rssi = s_last_sta_rssi;
+    }
+
+    if (!wifi_manager_is_sta_connected() && !s_sta_connecting && s_last_sta_reason != 0xff) {
+        info->sta_conn_end_reason_set = true;
+        info->sta_conn_end_reason = s_last_sta_reason;
+    }
+}
+
+static void blufi_send_wifi_report(void)
+{
+    if (!s_connected) {
+        return;
+    }
+
+    wifi_mode_t mode = WIFI_MODE_APSTA;
+    esp_wifi_get_mode(&mode);
+
+    esp_blufi_extra_info_t info;
+    build_blufi_conn_info(&info);
+
+    esp_blufi_sta_conn_state_t state;
+    if (wifi_manager_is_sta_connected()) {
+        state = ESP_BLUFI_STA_CONN_SUCCESS;
+        s_sta_connecting = false;
+    } else if (s_sta_connecting) {
+        state = ESP_BLUFI_STA_CONNECTING;
+    } else {
+        state = ESP_BLUFI_STA_CONN_FAIL;
+    }
+
+    esp_err_t err = esp_blufi_send_wifi_conn_report(mode,
+                                                    state,
+                                                    (uint8_t)softap_get_current_connection_number(),
+                                                    &info);
+    if (err != ESP_OK) {
+        APP_LOGW(TAG, "send wifi report failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void blufi_send_wifi_list(void)
+{
+    if (!s_connected) {
+        APP_LOGI(TAG, "skip wifi list send, BluFi not connected");
+        return;
+    }
+
+    uint16_t ap_count = 0;
+    if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK || ap_count == 0) {
+        APP_LOGW(TAG, "no AP found for BluFi scan");
+        return;
+    }
+
+    if (ap_count > BLUFI_SCAN_LIST_MAX_AP) {
+        ap_count = BLUFI_SCAN_LIST_MAX_AP;
+    }
+
+    wifi_ap_record_t *ap_list = calloc(ap_count, sizeof(*ap_list));
+    esp_blufi_ap_record_t *blufi_list = calloc(ap_count, sizeof(*blufi_list));
+    if (ap_list == NULL || blufi_list == NULL) {
+        free(ap_list);
+        free(blufi_list);
+        APP_LOGE(TAG, "alloc wifi list failed");
+        return;
+    }
+
+    if (esp_wifi_scan_get_ap_records(&ap_count, ap_list) != ESP_OK) {
+        free(ap_list);
+        free(blufi_list);
+        APP_LOGW(TAG, "get AP records failed");
+        return;
+    }
+
+    for (uint16_t i = 0; i < ap_count; ++i) {
+        blufi_list[i].rssi = ap_list[i].rssi;
+        memcpy(blufi_list[i].ssid, ap_list[i].ssid, sizeof(ap_list[i].ssid));
+        blufi_list[i].ssid[sizeof(blufi_list[i].ssid) - 1] = '\0';
+    }
+
+    esp_err_t err = esp_blufi_send_wifi_list(ap_count, blufi_list);
+    if (err != ESP_OK) {
+        APP_LOGW(TAG, "send wifi list failed: %s", esp_err_to_name(err));
+    }
+
+    free(ap_list);
+    free(blufi_list);
+}
+
+static void blufi_wifi_event_handler(void *arg,
+                                     esp_event_base_t event_base,
+                                     int32_t event_id,
+                                     void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+        case WIFI_EVENT_STA_CONNECTED: {
+            wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
+            if (event != NULL) {
+                memcpy(s_last_sta_bssid, event->bssid, sizeof(s_last_sta_bssid));
+                s_last_sta_bssid_set = true;
+            }
+            APP_LOGI(TAG, "BluFi STA connected");
+            break;
+        }
+
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+            if (event != NULL) {
+                s_last_sta_reason = event->reason;
+                s_last_sta_rssi = event->rssi;
+            }
+            if (!wifi_manager_is_sta_connected()) {
+                s_sta_connecting = false;
+            }
+            APP_LOGW(TAG, "BluFi STA disconnected reason=%u", s_last_sta_reason);
+            blufi_send_wifi_report();
+            break;
+        }
+
+        case WIFI_EVENT_SCAN_DONE:
+            s_scan_in_progress = false;
+            APP_LOGI(TAG, "BluFi Wi-Fi scan done");
+            if (s_wifi_list_requested) {
+                s_wifi_list_requested = false;
+                blufi_send_wifi_list();
+            } else {
+                APP_LOGI(TAG, "ignore scan done, no BluFi wifi list request pending");
+            }
+            break;
+
+        case WIFI_EVENT_AP_START:
+        case WIFI_EVENT_AP_STOP:
+            blufi_send_wifi_report();
+            break;
+
+        default:
+            break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        s_sta_connecting = false;
+        APP_LOGI(TAG, "BluFi STA got IP");
+        blufi_send_wifi_report();
+    }
+}
+
+static void blufi_start_wifi_scan(void)
+{
+    if (s_scan_in_progress) {
+        APP_LOGI(TAG, "BluFi Wi-Fi scan already in progress");
+        return;
+    }
+
+    wifi_scan_config_t scan_cfg = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, false);
+    if (err != ESP_OK) {
+        APP_LOGW(TAG, "BluFi scan start failed: %s", esp_err_to_name(err));
+        esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
+        return;
+    }
+
+    s_scan_in_progress = true;
+    s_wifi_list_requested = true;
+}
+
+static void blufi_apply_pending_sta_config(void)
+{
+    if (s_pending_sta_ssid[0] == '\0') {
+        APP_LOGW(TAG, "BluFi connect request without SSID");
+        esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+        return;
+    }
+
+    if (!app_config_add_or_update_wifi(&s_cfg, s_pending_sta_ssid, s_pending_sta_pass)) {
+        APP_LOGW(TAG, "save STA profile failed");
+        esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+        return;
+    }
+
+    app_config_save(&s_cfg);
+    s_sta_connecting = true;
+    s_last_sta_reason = 0xff;
+    s_last_sta_rssi = -128;
+    wifi_manager_enable_sta_reconnect(true);
+    esp_wifi_disconnect();
+    wifi_manager_connect_specific_sta(&s_cfg,
+                                      s_pending_sta_ssid,
+                                      s_pending_sta_pass,
+                                      s_pending_sta_bssid,
+                                      s_pending_sta_bssid_set);
+    blufi_send_wifi_report();
+}
+
+static void blufi_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_BLUFI_EVENT_INIT_FINISH:
+        APP_LOGI(TAG, "BluFi init finish");
+        s_ready = true;
+        s_advertising = true;
+        esp_blufi_adv_start();
+        break;
+
+    case ESP_BLUFI_EVENT_DEINIT_FINISH:
+        APP_LOGI(TAG, "BluFi deinit finish");
+        s_ready = false;
+        s_advertising = false;
+        break;
+
+    case ESP_BLUFI_EVENT_BLE_CONNECT:
+        s_connected = true;
+        s_notify_enabled = true;
+        s_advertising = false;
+        s_conn_handle = param->connect.conn_id;
+        APP_LOGI(TAG, "BluFi BLE connected, conn=%u", s_conn_handle);
+        if (blufi_security_init() != ESP_OK) {
+            APP_LOGE(TAG, "BluFi security init failed");
+        }
+        esp_blufi_adv_stop();
+        break;
+
+    case ESP_BLUFI_EVENT_BLE_DISCONNECT:
+        APP_LOGI(TAG, "BluFi BLE disconnected");
+        s_connected = false;
+        s_notify_enabled = false;
+        s_advertising = true;
+        s_conn_handle = 0xFFFF;
+        s_wifi_list_requested = false;
+        blufi_security_deinit();
+        esp_blufi_adv_start();
+        break;
+
+    case ESP_BLUFI_EVENT_SET_WIFI_OPMODE:
+        APP_LOGI(TAG, "BluFi requested wifi mode=%d, keep APSTA", param->wifi_mode.op_mode);
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        break;
+
+    case ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP:
+        APP_LOGI(TAG, "BluFi request connect to AP");
+        blufi_apply_pending_sta_config();
+        break;
+
+    case ESP_BLUFI_EVENT_REQ_DISCONNECT_FROM_AP:
+        APP_LOGI(TAG, "BluFi request disconnect from AP");
+        s_sta_connecting = false;
+        wifi_manager_enable_sta_reconnect(false);
+        esp_wifi_disconnect();
+        blufi_send_wifi_report();
+        break;
+
+    case ESP_BLUFI_EVENT_GET_WIFI_STATUS:
+        APP_LOGI(TAG, "BluFi get wifi status");
+        blufi_send_wifi_report();
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_STA_BSSID:
+        memcpy(s_pending_sta_bssid, param->sta_bssid.bssid, sizeof(s_pending_sta_bssid));
+        s_pending_sta_bssid_set = true;
+        APP_LOGI(TAG, "BluFi recv STA BSSID");
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_STA_SSID:
+        if (param->sta_ssid.ssid_len <= 0 || param->sta_ssid.ssid_len > WIFI_SSID_MAX_LEN) {
+            APP_LOGW(TAG, "invalid BluFi STA SSID len=%d", param->sta_ssid.ssid_len);
+            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+            break;
+        }
+        memcpy(s_pending_sta_ssid, param->sta_ssid.ssid, (size_t)param->sta_ssid.ssid_len);
+        s_pending_sta_ssid[param->sta_ssid.ssid_len] = '\0';
+        APP_LOGI(TAG, "BluFi recv STA SSID=%s", s_pending_sta_ssid);
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_STA_PASSWD:
+        if (param->sta_passwd.passwd_len < 0 || param->sta_passwd.passwd_len > WIFI_PASS_MAX_LEN) {
+            APP_LOGW(TAG, "invalid BluFi STA password len=%d", param->sta_passwd.passwd_len);
+            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+            break;
+        }
+        memcpy(s_pending_sta_pass, param->sta_passwd.passwd, (size_t)param->sta_passwd.passwd_len);
+        s_pending_sta_pass[param->sta_passwd.passwd_len] = '\0';
+        APP_LOGI(TAG, "BluFi recv STA password len=%d", param->sta_passwd.passwd_len);
+        APP_LOG_HEX(TAG,
+                    "BluFi STA password raw bytes",
+                    param->sta_passwd.passwd,
+                    (size_t)param->sta_passwd.passwd_len);
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_SOFTAP_SSID:
+        if (param->softap_ssid.ssid_len <= 0 || param->softap_ssid.ssid_len > AP_NAME_MAX_LEN) {
+            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+            break;
+        }
+        memcpy(s_cfg.ap_name, param->softap_ssid.ssid, (size_t)param->softap_ssid.ssid_len);
+        s_cfg.ap_name[param->softap_ssid.ssid_len] = '\0';
+        s_cfg.has_ap_name = true;
+        app_config_save(&s_cfg);
+        wifi_manager_set_ap_name(s_cfg.ap_name);
+        APP_LOGI(TAG, "BluFi recv SoftAP SSID=%s", s_cfg.ap_name);
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_SOFTAP_PASSWD:
+        if (param->softap_passwd.passwd_len < 0 || param->softap_passwd.passwd_len > AP_PASS_MAX_LEN) {
+            esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
+            break;
+        }
+        memcpy(s_cfg.ap_pass, param->softap_passwd.passwd, (size_t)param->softap_passwd.passwd_len);
+        s_cfg.ap_pass[param->softap_passwd.passwd_len] = '\0';
+        s_cfg.has_ap_pass = true;
+        app_config_save(&s_cfg);
+        if (strlen(s_cfg.ap_pass) >= 8) {
+            wifi_manager_set_ap_password(s_cfg.ap_pass);
+        }
+        APP_LOGI(TAG, "BluFi recv SoftAP password len=%d", param->softap_passwd.passwd_len);
+        break;
+
+    case ESP_BLUFI_EVENT_GET_WIFI_LIST:
+        APP_LOGI(TAG, "BluFi request wifi list");
+        blufi_start_wifi_scan();
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_SLAVE_DISCONNECT_BLE:
+        APP_LOGI(TAG, "BluFi request disconnect BLE");
+        esp_blufi_disconnect();
+        break;
+
+    case ESP_BLUFI_EVENT_REPORT_ERROR:
+        APP_LOGW(TAG,
+                 "BluFi report error=%d(%s)",
+                 param->report_error.state,
+                 blufi_error_to_str(param->report_error.state));
+        esp_blufi_send_error_info(param->report_error.state);
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_SOFTAP_MAX_CONN_NUM:
+    case ESP_BLUFI_EVENT_RECV_SOFTAP_AUTH_MODE:
+    case ESP_BLUFI_EVENT_RECV_SOFTAP_CHANNEL:
+    case ESP_BLUFI_EVENT_RECV_USERNAME:
+    case ESP_BLUFI_EVENT_RECV_CA_CERT:
+    case ESP_BLUFI_EVENT_RECV_CLIENT_CERT:
+    case ESP_BLUFI_EVENT_RECV_SERVER_CERT:
+    case ESP_BLUFI_EVENT_RECV_CLIENT_PRIV_KEY:
+    case ESP_BLUFI_EVENT_RECV_SERVER_PRIV_KEY:
+        APP_LOGI(TAG, "BluFi event %d ignored in current firmware", event);
+        break;
+
+    case ESP_BLUFI_EVENT_RECV_CUSTOM_DATA:
+        APP_LOGI(TAG, "BluFi custom data len=%" PRIu32, param->custom_data.data_len);
+        break;
+
+    default:
+        break;
+    }
+}
+
+static esp_blufi_callbacks_t s_blufi_callbacks = {
+    .event_cb = blufi_event_callback,
+    .negotiate_data_handler = blufi_dh_negotiate_data_handler,
+    .encrypt_func = blufi_aes_encrypt,
+    .decrypt_func = blufi_aes_decrypt,
+    .checksum_func = blufi_crc_checksum,
+};
+
+static void blufi_on_reset(int reason)
+{
+    APP_LOGW(TAG, "NimBLE reset, reason=%d", reason);
+}
+
+static void blufi_on_sync(void)
+{
+    make_fixed_adv_name();
+    ble_svc_gap_device_name_set(s_adv_name);
+    esp_blufi_profile_init();
+}
+
+static esp_err_t blufi_controller_init(void)
+{
+    esp_bt_controller_status_t status = esp_bt_controller_get_status();
+    if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        return ESP_OK;
+    }
+
+    if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            APP_LOGW(TAG, "release classic bt memory failed: %s", esp_err_to_name(err));
+        }
+
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        err = esp_bt_controller_init(&bt_cfg);
+        if (err != ESP_OK) {
+            APP_LOGE(TAG, "bt controller init failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        status = esp_bt_controller_get_status();
+    }
+
+    if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
+        esp_err_t err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        if (err != ESP_OK) {
+            APP_LOGE(TAG, "bt controller enable failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        return ESP_OK;
+    }
+
+    APP_LOGE(TAG, "unexpected bt controller status=%d", status);
+    return ESP_FAIL;
+}
+
+static esp_err_t blufi_host_init(void)
+{
+    esp_err_t err = blufi_controller_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_nimble_init();
+    if (err != ESP_OK) {
+        APP_LOGE(TAG, "esp_nimble_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ble_hs_cfg.reset_cb = blufi_on_reset;
+    ble_hs_cfg.sync_cb = blufi_on_sync;
+    ble_hs_cfg.gatts_register_cb = esp_blufi_gatt_svr_register_cb;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_hs_cfg.sm_io_cap = 4;
+    ble_hs_cfg.sm_sc = 0;
+    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_mitm = 0;
+
+    int rc = esp_blufi_gatt_svr_init();
+    if (rc != 0) {
+        APP_LOGE(TAG, "esp_blufi_gatt_svr_init failed: %d", rc);
+        return ESP_FAIL;
+    }
+
+    ble_store_config_init();
+    esp_blufi_btc_init();
+    return esp_nimble_enable(blufi_host_task);
+}
+
+static esp_err_t blufi_stack_init(void)
+{
+    esp_err_t err = esp_blufi_register_callbacks(&s_blufi_callbacks);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return blufi_host_init();
+}
+
 void ble_provision_init(const app_config_t *cfg, ble_cfg_apply_cb_t apply_cb)
 {
-    /*
-     * BLE 配网初始化入口。
-     *
-     * 初始化顺序：
-     * 1. 保存当前配置和应用回调。
-     * 2. 释放经典蓝牙内存，只保留 BLE。
-     * 3. 初始化 NimBLE、GAP、GATT。
-     * 4. 注册 FFF0/FFF1/FFF2 GATT 服务。
-     * 5. 启动 NimBLE Host 线程，等待 sync 后开始广播。
-     */
     if (cfg != NULL) {
         s_cfg = *cfg;
     } else {
         app_config_set_default(&s_cfg);
     }
-
     s_apply_cb = apply_cb;
-    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    (void)s_apply_cb;
 
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-    ESP_ERROR_CHECK(nimble_port_init());
+    make_fixed_adv_name();
+    s_conn_handle = 0xFFFF;
+    s_last_sta_reason = 0xff;
+    s_last_sta_rssi = -128;
 
-    ble_svc_gap_init();
-    ble_svc_gatt_init();
-
-    ble_hs_cfg.reset_cb = ble_stack_reset;
-    ble_hs_cfg.sync_cb = ble_stack_sync;
-    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
-
-    int rc = ble_gatts_count_cfg(s_svc_defs);
-    if (rc != 0) {
-        APP_LOGE(TAG, "ble_gatts_count_cfg failed: %d", rc);
-        return;
+    if (!s_wifi_event_registered) {
+        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &blufi_wifi_event_handler, NULL));
+        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &blufi_wifi_event_handler, NULL));
+        s_wifi_event_registered = true;
     }
 
-    rc = ble_gatts_add_svcs(s_svc_defs);
-    if (rc != 0) {
-        APP_LOGE(TAG, "ble_gatts_add_svcs failed: %d", rc);
-        return;
+    esp_err_t err = blufi_stack_init();
+    if (err != ESP_OK) {
+        APP_LOGE(TAG, "BluFi init failed: %s", esp_err_to_name(err));
+    } else {
+        APP_LOGI(TAG, "BluFi init started, adv_name=%s", s_adv_name);
     }
-
-    nimble_port_freertos_init(ble_host_task);
 }
 
 void ble_provision_refresh_advertising(void)
 {
-    /*
-     * Wi-Fi 状态变化后刷新广播。
-     * 如果当前手机已经连接 BLE，就不重启广播，避免影响连接中的配置流程。
-     */
-    if (!s_ble_synced || s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        return;
-    }
-
-    ble_restart_advertising();
+    blufi_send_wifi_report();
 }
 
 bool ble_provision_is_ready(void)
 {
-    return s_ble_synced;
+    return s_ready;
 }
 
 bool ble_provision_is_advertising(void)
 {
-    return ble_gap_adv_active();
+    return s_advertising && !s_connected;
 }
 
 bool ble_provision_is_connected(void)
 {
-    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+    return s_connected;
 }
 
 bool ble_provision_is_notify_enabled(void)

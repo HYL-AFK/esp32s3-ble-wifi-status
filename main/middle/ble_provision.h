@@ -1,37 +1,33 @@
 #pragma once
 
 /*
- * BLE 配网接口。
+ * BLE provisioning interface based on standard BluFi.
  *
- * 本模块基于 NimBLE GATT：
- * - 上电后启动 BLE 广播。
- * - 手机连接后向 FFF1 写入配置命令。
- * - 设备通过 FFF2 Notify 返回 ACK/ERR 或状态数据。
- *
- * 注意：当前 BLE 扫描名固定为 BMS + BLE MAC 后 3 字节。
- * NAME 命令保存的是“用户显示名”，不是扫描广播名。
+ * The BLE advertising/scan name is fixed to "ESPARK-PowerGo".
+ * Wi-Fi credentials are provisioned through the standard BluFi profile,
+ * not the old custom FFF0/FFF1/FFF2 command protocol.
  */
 
 #include <stdint.h>
 
 #include "app_config.h"
 
-/* BLE 收到配置并保存后，通过这个回调通知 main.c 重新应用 Wi-Fi/AP 配置。 */
+/* Called after BLE receives and saves new config, so main.c can re-apply Wi-Fi/AP config. */
 typedef void (*ble_cfg_apply_cb_t)(const app_config_t *cfg);
 
 void ble_provision_init(const app_config_t *cfg, ble_cfg_apply_cb_t apply_cb);
 
-/* Wi-Fi 状态变化时调用，用于刷新广播 Manufacturer Data 中的状态位。 */
+/* Push updated Wi-Fi status to BluFi peer after Wi-Fi state changes. */
 void ble_provision_refresh_advertising(void);
 
-/* 提供给 UI 层查询当前 BLE 运行状态。 */
+/* BLE runtime state for UI/status queries. */
 bool ble_provision_is_ready(void);
 bool ble_provision_is_advertising(void);
 bool ble_provision_is_connected(void);
 bool ble_provision_is_notify_enabled(void);
 
-/* 当前连接句柄；未连接时通常为 0xFFFF。 */
+/* Current BluFi connection handle; usually 0xFFFF when not connected. */
 uint16_t ble_provision_get_conn_handle(void);
 
-/* 当前广播名，固定为 BMS + BLE MAC 后 3 字节。 */
+/* Current advertising name, fixed to "ESPARK-PowerGo". */
 const char *ble_provision_get_adv_name(void);

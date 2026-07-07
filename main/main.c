@@ -17,6 +17,13 @@
 static const char *TAG = "main";
 
 /*
+ * Temporary BluFi verification switch:
+ * clear only the app-saved STA Wi-Fi profiles on each boot.
+ * Disable after ESPARK provisioning is verified.
+ */
+#define APP_TEST_CLEAR_SAVED_WIFI_ON_BOOT 0
+
+/*
  * 应用 BLE 下发的新配置。
  *
  * 当前策略：
@@ -63,6 +70,11 @@ void app_main(void)
     /* 加载应用持久化配置，包括 STA Wi-Fi 列表、BLE 显示名、AP 配置。 */
     app_config_t cfg;
     app_config_load(&cfg);
+#if APP_TEST_CLEAR_SAVED_WIFI_ON_BOOT
+    APP_LOGW(TAG, "test mode: erase saved STA Wi-Fi profiles on boot");
+    app_config_erase_wifi();
+    app_config_load(&cfg);
+#endif
 
 
     /* 初始化云端状态服务。该模块负责 SNTP、公网 IP、地区和天气。 */
@@ -106,9 +118,12 @@ void app_main(void)
      * 2. 启动 Wi-Fi 管理；
      * 3. 如果本地已有 STA 配置，则尝试自动连接。
      */
-    ble_provision_init(&cfg, apply_wifi_cfg);
     wifi_manager_set_status_cb(handle_wifi_status_changed);
     wifi_manager_init(&cfg);
+#if APP_TEST_CLEAR_SAVED_WIFI_ON_BOOT
+    wifi_manager_disconnect_sta();
+#endif
+    ble_provision_init(&cfg, apply_wifi_cfg);
     ui_status_refresh();
 
     if (cfg.has_wifi && cfg.wifi_count > 0) {

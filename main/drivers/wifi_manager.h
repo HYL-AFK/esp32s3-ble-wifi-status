@@ -22,6 +22,13 @@ void wifi_manager_init(const app_config_t *cfg);
 /* 从 cfg 中选择可用且信号最强的已保存 Wi-Fi，并发起 STA 连接。 */
 void wifi_manager_connect_sta(const app_config_t *cfg);
 
+/* Connect directly to the specified STA target, used by BluFi provisioning. */
+void wifi_manager_connect_specific_sta(const app_config_t *cfg,
+                                       const char *ssid,
+                                       const char *pass,
+                                       const uint8_t *bssid,
+                                       bool bssid_set);
+
 /* 断开 STA，并清空 ESP-IDF Wi-Fi 驱动里的 STA 配置，避免清除 NVS 后又自动连回去。 */
 void wifi_manager_disconnect_sta(void);
 void wifi_manager_reconnect_sta(void);

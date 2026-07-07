@@ -10,6 +10,7 @@ idf_component_register(
         "drivers/wifi_manager.c"
         "drivers/mesh_audio_board.c"
         "middle/ble_provision.c"
+        "middle/blufi_security.c"
         "middle/mesh_audio_node.c"
         "app/mesh_audio_gateway.c"
         "app/mesh_audio_controller.c"

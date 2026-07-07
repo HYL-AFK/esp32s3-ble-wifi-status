@@ -537,6 +537,10 @@ static esp_err_t refresh_public_ip(cloud_service_snapshot_t *snap)
 
     snap->public_ip_valid = true;
     APP_LOGI(TAG, "public ip: %s", snap->public_ip);
+    APP_LOG_STATE(TAG,
+                  "WAN net: lan_ip=%s public_ip=%s",
+                  snap->sta_ip[0] != '\0' ? snap->sta_ip : "-",
+                  snap->public_ip);
     return ESP_OK;
 }
 

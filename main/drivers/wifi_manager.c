@@ -55,9 +55,71 @@ static char s_sta_phy[8] = "N/A";
 static wifi_status_cb_t s_status_cb = NULL;
 static app_config_t s_saved_cfg;
 static char s_last_connected_ssid[WIFI_SSID_MAX_LEN + 1] = "";
+static char s_preferred_fallback_ssid[WIFI_SSID_MAX_LEN + 1] = "";
 static bool s_last_connected_seen_in_scan = false;
 static wifi_ap_record_t s_last_connected_scan_ap;
 static TaskHandle_t s_reconnect_task = NULL;
+
+static void update_ap_ip_cache(void);
+
+static const char *wifi_disconnect_reason_to_str(int reason)
+{
+    switch (reason) {
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY:
+        return "DISASSOC_DUE_TO_INACTIVITY";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "BEACON_TIMEOUT";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "NO_AP_FOUND";
+    case WIFI_REASON_AUTH_FAIL:
+        return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:
+        return "ASSOC_FAIL";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "CONNECTION_FAIL";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+        return "NO_AP_FOUND_W_COMPATIBLE_SECURITY";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return "NO_AP_FOUND_IN_AUTHMODE_THRESHOLD";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+        return "NO_AP_FOUND_IN_RSSI_THRESHOLD";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *wifi_disconnect_reason_hint(int reason)
+{
+    switch (reason) {
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY:
+        return "AP dropped link or signal unstable";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "password mismatch, weak signal, or WPA handshake compatibility issue";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "signal too weak or AP not stable";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "AP not seen in scan; hidden, offline, too weak, or 5GHz-only";
+    case WIFI_REASON_AUTH_FAIL:
+        return "authentication failed; check password or auth mode";
+    case WIFI_REASON_ASSOC_FAIL:
+        return "association failed; AP rejected station";
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "generic connection failure";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+        return "SSID exists but security mode is incompatible";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return "SSID exists but below authmode threshold";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+        return "SSID exists but signal below RSSI threshold";
+    default:
+        return "-";
+    }
+}
 /*
  * 统一状态通知入口。
  * 当前主要用于通知 BLE 模块刷新广播 Manufacturer Data 中的状态位。
@@ -69,6 +131,95 @@ static void notify_status_changed(void)
     {
         s_status_cb();
     }
+}
+
+static void format_mac_string(const uint8_t mac[6], char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+
+    if (mac == NULL) {
+        strlcpy(out, "-", out_size);
+        return;
+    }
+
+    snprintf(out,
+             out_size,
+             "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void log_ap_network_info(void)
+{
+    uint8_t ap_mac[6] = {0};
+    char ap_mac_str[18] = "-";
+
+    update_ap_ip_cache();
+    if (esp_wifi_get_mac(WIFI_IF_AP, ap_mac) == ESP_OK) {
+        format_mac_string(ap_mac, ap_mac_str, sizeof(ap_mac_str));
+    }
+
+    APP_LOG_STATE(TAG,
+                  "AP net: ssid=%s ip=%s channel=%d mac=%s",
+                  s_ap_name,
+                  s_ap_ip_str,
+                  s_ap_channel,
+                  ap_mac_str);
+}
+
+static void log_sta_network_info(const ip_event_got_ip_t *event)
+{
+    if (event == NULL) {
+        return;
+    }
+
+    uint8_t sta_mac[6] = {0};
+    uint8_t sta_bssid[6] = {0};
+    char sta_mac_str[18] = "-";
+    char sta_bssid_str[18] = "-";
+    char mask_str[16] = "0.0.0.0";
+    char gw_str[16] = "0.0.0.0";
+    char dns1_str[16] = "0.0.0.0";
+    char dns2_str[16] = "0.0.0.0";
+
+    esp_ip4addr_ntoa(&event->ip_info.netmask, mask_str, sizeof(mask_str));
+    esp_ip4addr_ntoa(&event->ip_info.gw, gw_str, sizeof(gw_str));
+
+    if (esp_wifi_get_mac(WIFI_IF_STA, sta_mac) == ESP_OK) {
+        format_mac_string(sta_mac, sta_mac_str, sizeof(sta_mac_str));
+    }
+
+    if (wifi_manager_get_sta_bssid(sta_bssid)) {
+        format_mac_string(sta_bssid, sta_bssid_str, sizeof(sta_bssid_str));
+    }
+
+    esp_netif_dns_info_t dns = {0};
+    if (s_sta_netif != NULL &&
+        esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
+        esp_ip4addr_ntoa(&dns.ip.u_addr.ip4, dns1_str, sizeof(dns1_str));
+    }
+    memset(&dns, 0, sizeof(dns));
+    if (s_sta_netif != NULL &&
+        esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &dns) == ESP_OK) {
+        esp_ip4addr_ntoa(&dns.ip.u_addr.ip4, dns2_str, sizeof(dns2_str));
+    }
+
+    APP_LOG_STATE(TAG,
+                  "STA wifi: ssid=%s bssid=%s rssi=%d channel=%d phy=%s sta_mac=%s",
+                  s_sta_ssid[0] != '\0' ? s_sta_ssid : "-",
+                  sta_bssid_str,
+                  s_sta_rssi,
+                  s_sta_channel,
+                  s_sta_phy,
+                  sta_mac_str);
+    APP_LOG_STATE(TAG,
+                  "STA net: ip=%s mask=%s gw=%s dns1=%s dns2=%s",
+                  s_sta_ip_str,
+                  mask_str,
+                  gw_str,
+                  dns1_str,
+                  dns2_str);
 }
 
 static void sta_reconnect_task(void *arg)
@@ -197,8 +348,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
          * 如果 s_sta_reconnect_enabled=true，则让 ESP-IDF 继续重连。
          */
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
-        APP_LOGW(TAG, "STA disconnected, reason=%d, reconnect=%d, saved=%d",
+        APP_LOGW(TAG, "STA disconnected, reason=%d(%s), hint=%s, reconnect=%d, saved=%d",
                  event != NULL ? event->reason : -1,
+                 event != NULL ? wifi_disconnect_reason_to_str(event->reason) : "UNKNOWN",
+                 event != NULL ? wifi_disconnect_reason_hint(event->reason) : "-",
                  s_sta_reconnect_enabled ? 1 : 0,
                  (s_saved_cfg.has_wifi && s_saved_cfg.wifi_count > 0) ? 1 : 0);
         s_sta_connected = false;
@@ -219,6 +372,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         /* AP 热点已经启动，手机应能扫描到 s_ap_name。 */
         s_ap_started = true;
         APP_LOGI(TAG, "AP start, ssid=%s", s_ap_name);
+        log_ap_network_info();
         notify_status_changed();
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STOP)
@@ -237,6 +391,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         APP_LOGI(TAG, "STA got IP: %s", s_sta_ip_str);
         refresh_sta_runtime_info(NULL);
         strlcpy(s_last_connected_ssid, s_sta_ssid, sizeof(s_last_connected_ssid));
+        strlcpy(s_preferred_fallback_ssid, s_sta_ssid, sizeof(s_preferred_fallback_ssid));
+        log_sta_network_info(event);
         notify_status_changed();
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED)
@@ -414,8 +570,11 @@ static bool find_best_saved_profile(const app_config_t *cfg, wifi_ap_record_t *b
     int best_usable_score = INT_MIN;
     bool found = false;
     bool found_usable = false;
+    bool preferred_found = false;
     wifi_ap_record_t fallback_ap = {0};
     wifi_profile_t fallback_profile = {0};
+    wifi_ap_record_t preferred_ap = {0};
+    wifi_profile_t preferred_profile = {0};
     s_last_connected_seen_in_scan = false;
     memset(&s_last_connected_scan_ap, 0, sizeof(s_last_connected_scan_ap));
 
@@ -444,6 +603,15 @@ static bool find_best_saved_profile(const app_config_t *cfg, wifi_ap_record_t *b
             }
 
             int score = score_scan_result(&records[j]);
+            if (s_preferred_fallback_ssid[0] != '\0' &&
+                strcmp((char *)records[j].ssid, s_preferred_fallback_ssid) == 0) {
+                if (!preferred_found || score > score_scan_result(&preferred_ap)) {
+                    preferred_ap = records[j];
+                    preferred_profile = cfg->wifi_profiles[i];
+                    preferred_found = true;
+                }
+            }
+
             if (!found || score > best_score)
             {
                 best_score = score;
@@ -463,6 +631,16 @@ static bool find_best_saved_profile(const app_config_t *cfg, wifi_ap_record_t *b
         }
     }
 
+    if (preferred_found) {
+        APP_LOGI(TAG,
+                 "prefer current target SSID=%s over strongest saved candidate",
+                 preferred_profile.wifi_ssid);
+        *best_ap = preferred_ap;
+        *best_profile = preferred_profile;
+        free(records);
+        return true;
+    }
+
     if (!found_usable && found) {
         APP_LOGW(TAG, "all matched Wi-Fi signals are weak, fallback best SSID=%s RSSI=%d threshold=%d",
                  fallback_profile.wifi_ssid,
@@ -474,6 +652,49 @@ static bool find_best_saved_profile(const app_config_t *cfg, wifi_ap_record_t *b
 
     free(records);
     return found;
+}
+
+void wifi_manager_connect_specific_sta(const app_config_t *cfg,
+                                       const char *ssid,
+                                       const char *pass,
+                                       const uint8_t *bssid,
+                                       bool bssid_set)
+{
+    if (cfg != NULL) {
+        s_saved_cfg = *cfg;
+    }
+    if (ssid != NULL && ssid[0] != '\0') {
+        strlcpy(s_preferred_fallback_ssid, ssid, sizeof(s_preferred_fallback_ssid));
+    }
+
+    if (ssid == NULL || pass == NULL || ssid[0] == '\0') {
+        APP_LOGW(TAG, "skip specific STA connect, invalid credentials");
+        return;
+    }
+
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password));
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta_cfg.sta.pmf_cfg.capable = true;
+    sta_cfg.sta.pmf_cfg.required = false;
+
+    if (bssid_set && bssid != NULL) {
+        memcpy(sta_cfg.sta.bssid, bssid, sizeof(sta_cfg.sta.bssid));
+        sta_cfg.sta.bssid_set = 1;
+    }
+
+    APP_LOGI(TAG,
+             "connecting STA directly to SSID=%s bssid_set=%d",
+             ssid,
+             bssid_set ? 1 : 0);
+    s_sta_reconnect_enabled = true;
+    strlcpy(s_sta_ssid, ssid, sizeof(s_sta_ssid));
+    s_sta_rssi = -127;
+    s_sta_channel = 0;
+    strlcpy(s_sta_phy, "N/A", sizeof(s_sta_phy));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_connect());
 }
 
 void wifi_manager_connect_sta(const app_config_t *cfg)
@@ -499,9 +720,22 @@ void wifi_manager_connect_sta(const app_config_t *cfg)
          * 先回退到第一条有效保存配置做一次直连，让驱动侧继续完成后续扫描和重连。
          */
         for (int i = 0; i < cfg->wifi_count; ++i) {
+            if (s_preferred_fallback_ssid[0] != '\0' &&
+                cfg->wifi_profiles[i].valid &&
+                strcmp(cfg->wifi_profiles[i].wifi_ssid, s_preferred_fallback_ssid) == 0) {
+                best_profile = cfg->wifi_profiles[i];
+                APP_LOGW(TAG,
+                         "scan miss, fallback prefer SSID=%s; AP may be hidden/offline/weak or 5GHz-only",
+                         best_profile.wifi_ssid);
+                goto connect_sta;
+            }
+        }
+
+        for (int i = 0; i < cfg->wifi_count; ++i) {
             if (cfg->wifi_profiles[i].valid && cfg->wifi_profiles[i].wifi_ssid[0] != '\0') {
                 best_profile = cfg->wifi_profiles[i];
-                APP_LOGW(TAG, "scan miss, fallback connect SSID=%s",
+                APP_LOGW(TAG,
+                         "scan miss, fallback connect SSID=%s; AP may be hidden/offline/weak or 5GHz-only",
                          best_profile.wifi_ssid);
                 goto connect_sta;
             }
@@ -585,6 +819,7 @@ void wifi_manager_disconnect_sta(void)
     strlcpy(s_sta_phy, "N/A", sizeof(s_sta_phy));
     s_sta_ssid[0] = '\0';
     s_last_connected_ssid[0] = '\0';
+    s_preferred_fallback_ssid[0] = '\0';
     strlcpy(s_sta_ip_str, "0.0.0.0", sizeof(s_sta_ip_str));
     esp_wifi_disconnect();
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &(wifi_config_t){0}));
